@@ -170,7 +170,11 @@ class CatiaClient:
         pad = shape_factory.AddNewPad(sketch, float(height_mm))
 
         if part_name:
-            part.Name = str(part_name)
+            # Part.Name 在部分 CATIA 版本/上下文中只读，改不动就跳过，不打断建模
+            try:
+                part.Name = str(part_name)
+            except pythoncom.com_error:  # type: ignore[attr-defined]
+                pass
 
         # 5) 更新检查 —— 命令返回 ≠ 几何合格，必须 Update 并捕获失败
         update_ok = True
