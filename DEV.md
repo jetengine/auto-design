@@ -165,8 +165,50 @@ python -c "from catia_mcp.com_worker import ComWorker; w=ComWorker(); w.start();
 
 启动 CATIA → 重启 MCP 客户端 → 问它 **"CATIA 现在是什么版本、打开了哪个文档？"**，它应当调用 `get_catia_session` 并如实回答。
 
-### 5.4 再下一步
+## 6. 第一个写操作 —— `create_box`（建模 + 体积回读验证）
 
-1. 加只读测量工具（`measure_*`），继续零风险扩充证据类工具。
-2. 再加第一个**写操作**：新建 Part + 画长方体 Pad（进入"检查证据 → 迭代修复"闭环）。
-3. 引入超时熔断 + 会话心跳看门狗（可行性分析里的 1、3 号风险）。
+第一个会**改变模型**的工具。它建一个长方体（草图矩形 + Pad 原生特征），并遵循"命令返回 ≠ 几何合格"原则：建模后 `Update` + 回读体积 + 与理论值比对，把证据一并返回。
+
+### 6.1 无 AI 冒烟测试（Windows，CATIA 已启动）
+
+```powershell
+python scripts\create_box_smoke.py
+```
+
+期望输出（关键字段）：
+
+```
+✅ 长方体建模完成，证据如下：
+  document_name         : Part2.CATPart
+  body_name             : PartBody
+  sketch_name           : Sketch.1
+  pad_name              : Pad.1
+  update_ok             : True
+  expected_volume_mm3   : 120000.0
+  measured_volume_mm3   : 120000.0000...
+  volume_match          : True
+  relative_error        : ~0.0
+
+判定： ✅ 几何合格
+```
+
+- `update_ok=True` → 特征树更新无红叉。
+- `volume_match=True` → 回读体积与 L×W×H 吻合（容差 0.1%）。
+- 两者都为真才算"几何合格"——这是第一次把"检查证据"落进代码。
+
+> 若 `measured_volume_mm3` 为 `null`：说明 SPAWorkbench 测量在你这个环境不可用（不影响建模），把报错贴来，我换一种测量方式。
+
+### 6.2 让 AI 建模
+
+重载 MCP 客户端后，对它说：**"帮我建一个 100×60×20 的长方体。"**
+
+它应当调用 `create_box(length_mm=100, width_mm=60, height_mm=20)`，然后根据返回的 `update_ok` / `volume_match` 告诉你是否成功。这就是主执行链的第一次完整跑通：
+
+> 自然语言需求 → 工具调用 → CATIA 原生特征 → 检查证据 →（若不合格）迭代修复
+
+### 6.3 再下一步
+
+1. 加**安全保存 + STEP 导出/回读**（可行性分析里的验证原则 5）。
+2. 加 `measure_*` 只读测量族，扩充证据类工具。
+3. 引入超时熔断 + 会话心跳看门狗（1、3 号风险）。
+4. 扩到 Pocket / Fillet 等更多 Part Design 特征。

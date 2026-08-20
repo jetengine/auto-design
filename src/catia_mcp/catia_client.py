@@ -37,6 +37,24 @@ class CatiaSessionInfo:
     caption: str                # CATIA 主窗口标题，做人眼二次校验
 
 
+@dataclass
+class BoxResult:
+    """create_box 的结构化返回 —— 既是操作结果，也是「检查证据」。"""
+
+    document_name: str          # 新建 Part 文档名
+    body_name: str              # 承载几何的 Body（PartBody）名
+    sketch_name: str            # 底面草图名
+    pad_name: str               # 拉伸特征名
+    length_mm: float
+    width_mm: float
+    height_mm: float
+    update_ok: bool             # 特征树 Update 是否成功（无红叉）
+    expected_volume_mm3: float  # 理论体积 = L×W×H
+    measured_volume_mm3: Optional[float]  # 从 CATIA 回读的真实体积（失败则 None）
+    volume_match: Optional[bool]          # 回读体积是否与理论值吻合（容差内）
+    relative_error: Optional[float]       # 相对误差，便于诊断
+
+
 class CatiaClient:
     """连接到本机上已经打开的 CATIA 会话。
 
@@ -97,6 +115,110 @@ class CatiaClient:
             document_count=doc_count,
             caption=caption,
         )
+
+    # ------------------------------------------------------------------
+    # 写操作（原生特征）
+    # ------------------------------------------------------------------
+    def create_box(
+        self,
+        length_mm: float,
+        width_mm: float,
+        height_mm: float,
+        part_name: Optional[str] = None,
+        volume_tolerance: float = 1e-3,
+    ) -> BoxResult:
+        """新建一个 Part，用「草图矩形 + Pad」原生特征建一个长方体，并回读体积验证。
+
+        这是第一个写操作，刻意做成完整闭环：
+            建模（原生特征）→ Update（更新检查）→ 回读体积（几何证据）→ 比对（合格判定）
+
+        参数：
+            length_mm/width_mm/height_mm: 长宽高（毫米）
+            part_name: 可选，Part 文档命名
+            volume_tolerance: 体积相对误差容差，默认 0.1%
+
+        产出保留可编辑特征树：Sketch + Pad，参数与引用完整。
+        """
+        if min(length_mm, width_mm, height_mm) <= 0:
+            raise ValueError("长宽高必须为正数。")
+
+        app = self._require_app()
+
+        # 1) 新建 Part 文档
+        part_doc = app.Documents.Add("Part")
+        part = part_doc.Part
+
+        # 2) 取 PartBody 与 XY 基准面
+        body = part.Bodies.Item(1)  # 默认的 PartBody
+        xy_plane = part.OriginElements.PlaneXY
+
+        # 3) 在 XY 面上建草图，画一个矩形（4 条首尾相接的直线 → 闭合轮廓）
+        sketch = body.Sketches.Add(xy_plane)
+        factory_2d = sketch.OpenEdition()
+        length = float(length_mm)
+        width = float(width_mm)
+        # 矩形四角：(0,0)-(L,0)-(L,W)-(0,W)
+        factory_2d.CreateLine(0.0, 0.0, length, 0.0)
+        factory_2d.CreateLine(length, 0.0, length, width)
+        factory_2d.CreateLine(length, width, 0.0, width)
+        factory_2d.CreateLine(0.0, width, 0.0, 0.0)
+        sketch.CloseEdition()
+
+        # 4) 拉伸成 Pad（原生 Part Design 特征）
+        part.InWorkObject = body
+        shape_factory = part.ShapeFactory
+        pad = shape_factory.AddNewPad(sketch, float(height_mm))
+
+        if part_name:
+            part.Name = str(part_name)
+
+        # 5) 更新检查 —— 命令返回 ≠ 几何合格，必须 Update 并捕获失败
+        update_ok = True
+        try:
+            part.Update()
+        except pythoncom.com_error:  # type: ignore[attr-defined]
+            update_ok = False
+
+        # 6) 回读体积证据
+        expected = length * width * float(height_mm)
+        measured = self._measure_volume_mm3(part_doc, part, body)
+        match: Optional[bool] = None
+        rel_err: Optional[float] = None
+        if measured is not None and expected > 0:
+            rel_err = abs(measured - expected) / expected
+            match = rel_err <= volume_tolerance
+
+        return BoxResult(
+            document_name=str(part_doc.Name),
+            body_name=str(body.Name),
+            sketch_name=str(sketch.Name),
+            pad_name=str(pad.Name),
+            length_mm=length,
+            width_mm=width,
+            height_mm=float(height_mm),
+            update_ok=update_ok,
+            expected_volume_mm3=expected,
+            measured_volume_mm3=measured,
+            volume_match=match,
+            relative_error=rel_err,
+        )
+
+    # ------------------------------------------------------------------
+    def _measure_volume_mm3(self, part_doc, part, body) -> Optional[float]:
+        """用 SPAWorkbench 回读实体体积，返回 mm³。失败返回 None（不阻断建模）。
+
+        CATIA 测量 API 返回 SI 单位（m³），换算成 mm³ 需乘 1e9。
+        """
+        try:
+            spa = part_doc.GetWorkbench("SPAWorkbench")
+            ref = part.CreateReferenceFromObject(body)
+            measurable = spa.GetMeasurable(ref)
+            volume_m3 = float(measurable.Volume)  # SI: m³
+            return volume_m3 * 1e9  # → mm³
+        except pythoncom.com_error:  # type: ignore[attr-defined]
+            return None
+        except Exception:  # noqa: BLE001 —— 测量失败不应打断主流程
+            return None
 
     # ------------------------------------------------------------------
     def _require_app(self):
