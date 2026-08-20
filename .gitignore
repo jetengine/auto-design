@@ -17,3 +17,6 @@ Thumbs.db
 *.CATPart.bak
 *.CATProduct.bak
 CNEXT*.err
+
+# 建模输出
+out/

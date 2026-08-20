@@ -95,6 +95,41 @@ def create_box(
     return asdict(result)
 
 
+@mcp.tool()
+def export_step_and_verify(
+    step_path: str,
+    catpart_path: str | None = None,
+) -> dict:
+    """把当前活动 Part 安全保存为 CATPart（可选）并导出 STEP，再回读 STEP 验证体积。
+
+    对应工程验证原则 5「STEP 回读」：导出后重新导入 STEP，比对体积，防止几何丢失。
+
+    参数：
+        step_path:    STEP 导出路径（.stp / .step，绝对路径）
+        catpart_path: 可选，同时安全保存 .CATPart（.CATPart，绝对路径）
+
+    返回（既是结果也是证据）：
+        catpart_saved:          CATPart 是否成功落盘
+        step_written:           STEP 文件是否真实存在且非空（实时文件验证）
+        step_size_bytes:        STEP 文件大小
+        source_volume_mm3:      导出前原实体体积
+        reimported_volume_mm3:  STEP 回读后重新测得的体积
+        volume_match:           回读体积是否与原始吻合（容差 1% 内）
+        relative_error:         相对误差
+
+    使用建议：step_written 与 volume_match 都为 true 才算交付合格。
+    """
+
+    def _job(client: CatiaClient):
+        return client.export_step_and_verify(
+            step_path=step_path,
+            catpart_path=catpart_path,
+        )
+
+    # 保存 + 导出 + 重新打开测量，耗时较长
+    result = _worker.call(_job, timeout=180.0)
+    return asdict(result)
+
 
 def main() -> None:
     """stdio 模式启动 MCP server。"""

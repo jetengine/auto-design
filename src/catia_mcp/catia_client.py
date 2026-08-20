@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 from dataclasses import dataclass
 from typing import Optional
@@ -53,6 +54,21 @@ class BoxResult:
     measured_volume_mm3: Optional[float]  # 从 CATIA 回读的真实体积（失败则 None）
     volume_match: Optional[bool]          # 回读体积是否与理论值吻合（容差内）
     relative_error: Optional[float]       # 相对误差，便于诊断
+
+
+@dataclass
+class ExportResult:
+    """安全保存 + STEP 导出回读的结构化证据（对应验证原则 5）。"""
+
+    catpart_path: Optional[str]           # 保存的 .CATPart 路径（未保存则 None）
+    catpart_saved: bool                   # CATPart 是否成功落盘
+    step_path: str                        # 导出的 STEP 路径
+    step_written: bool                    # STEP 文件是否真实存在且非空
+    step_size_bytes: Optional[int]        # STEP 文件大小（实时文件验证）
+    source_volume_mm3: Optional[float]    # 导出前原实体体积
+    reimported_volume_mm3: Optional[float]  # STEP 回读后重新测得的体积
+    volume_match: Optional[bool]          # 回读体积是否与原始吻合（容差内）
+    relative_error: Optional[float]       # 相对误差
 
 
 class CatiaClient:
@@ -206,6 +222,121 @@ class CatiaClient:
             volume_match=match,
             relative_error=rel_err,
         )
+
+    # ------------------------------------------------------------------
+    # 安全保存 + STEP 导出回读（验证原则 5）
+    # ------------------------------------------------------------------
+    def export_step_and_verify(
+        self,
+        step_path: str,
+        catpart_path: Optional[str] = None,
+        volume_tolerance: float = 1e-2,
+    ) -> ExportResult:
+        """把当前活动 Part 安全保存为 CATPart（可选）并导出 STEP，再回读 STEP 验证体积。
+
+        对应工程验证原则 5「STEP 回读」：导出中性格式后重新导入，比对体积，
+        防止导出过程中的几何丢失/退化。容差默认 1%（STEP 转换会有微小误差）。
+
+        参数：
+            step_path:    STEP 导出路径（.stp / .step）
+            catpart_path: 可选，同时安全保存 .CATPart
+            volume_tolerance: 体积相对误差容差
+        """
+        app = self._require_app()
+
+        # 0) 校验输出路径（实时文件验证 = 安全边界）
+        step_path = self._validate_output_path(step_path, {".stp", ".step"})
+        if catpart_path is not None:
+            catpart_path = self._validate_output_path(catpart_path, {".catpart"})
+
+        # 1) 取活动 Part 文档
+        part_doc = app.ActiveDocument
+        part = part_doc.Part
+        body = part.Bodies.Item(1)
+
+        # 2) 导出前测原始体积
+        source_vol = self._measure_volume_mm3(part_doc, part, body)
+
+        # 3) 安全保存 CATPart（可选）
+        catpart_saved = False
+        if catpart_path is not None:
+            part_doc.SaveAs(catpart_path)
+            catpart_saved = os.path.isfile(catpart_path) and os.path.getsize(catpart_path) > 0
+
+        # 4) 导出 STEP
+        part_doc.ExportData(step_path, "stp")
+
+        # 5) 实时文件验证：确认 STEP 真的写出来了
+        step_written = os.path.isfile(step_path) and os.path.getsize(step_path) > 0
+        step_size = os.path.getsize(step_path) if os.path.isfile(step_path) else None
+
+        # 6) STEP 回读：重新打开导入并测体积
+        reimported_vol: Optional[float] = None
+        if step_written:
+            reimported_vol = self._reimport_step_volume(app, step_path)
+
+        # 7) 比对
+        match: Optional[bool] = None
+        rel_err: Optional[float] = None
+        if source_vol and reimported_vol:
+            rel_err = abs(reimported_vol - source_vol) / source_vol
+            match = rel_err <= volume_tolerance
+
+        return ExportResult(
+            catpart_path=catpart_path,
+            catpart_saved=catpart_saved,
+            step_path=step_path,
+            step_written=step_written,
+            step_size_bytes=step_size,
+            source_volume_mm3=source_vol,
+            reimported_volume_mm3=reimported_vol,
+            volume_match=match,
+            relative_error=rel_err,
+        )
+
+    # ------------------------------------------------------------------
+    def _validate_output_path(self, path: str, allowed_ext: set[str]) -> str:
+        """校验并规范化输出路径：绝对路径 + 扩展名白名单 + 父目录存在。
+
+        这是「实时文件验证」安全边界的落点，父目录不存在则创建。
+        """
+        if not path or not str(path).strip():
+            raise ValueError("输出路径不能为空。")
+        abspath = os.path.abspath(os.path.expanduser(str(path)))
+        ext = os.path.splitext(abspath)[1].lower()
+        if ext not in allowed_ext:
+            raise ValueError(f"扩展名 {ext!r} 不在允许列表 {sorted(allowed_ext)} 中。")
+        parent = os.path.dirname(abspath)
+        os.makedirs(parent, exist_ok=True)
+        return abspath
+
+    # ------------------------------------------------------------------
+    def _reimport_step_volume(self, app, step_path: str) -> Optional[float]:
+        """重新打开 STEP 文件并测量体积（mm³）。失败返回 None。
+
+        STEP 打开后可能是 Part 或 Product，做防御式处理，测不出就返回 None。
+        """
+        doc = None
+        try:
+            doc = app.Documents.Open(step_path)
+            try:
+                part = doc.Part
+                body = part.Bodies.Item(1)
+                return self._measure_volume_mm3(doc, part, body)
+            except (AttributeError, pythoncom.com_error):  # type: ignore[attr-defined]
+                # 打开成了 Product 或结构不同 —— 本阶段不深挖，返回 None
+                return None
+        except pythoncom.com_error:  # type: ignore[attr-defined]
+            return None
+        except Exception:  # noqa: BLE001
+            return None
+        finally:
+            # 回读用的临时文档关掉，不污染会话（不保存）
+            if doc is not None:
+                try:
+                    doc.Close()
+                except Exception:  # noqa: BLE001
+                    pass
 
     # ------------------------------------------------------------------
     def _measure_volume_mm3(self, part_doc, part, body) -> Optional[float]:

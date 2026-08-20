@@ -206,9 +206,46 @@ python scripts\create_box_smoke.py
 
 > 自然语言需求 → 工具调用 → CATIA 原生特征 → 检查证据 →（若不合格）迭代修复
 
-### 6.3 再下一步
+## 7. 安全保存 + STEP 导出回读 —— `export_step_and_verify`（验证原则 5）
 
-1. 加**安全保存 + STEP 导出/回读**（可行性分析里的验证原则 5）。
-2. 加 `measure_*` 只读测量族，扩充证据类工具。
-3. 引入超时熔断 + 会话心跳看门狗（1、3 号风险）。
-4. 扩到 Pocket / Fillet 等更多 Part Design 特征。
+把活动 Part 安全保存为 `.CATPart`（可编辑特征树）并导出 `.STEP`（中性格式），再**重新打开 STEP 回读体积**与原始比对，防止导出过程几何丢失。
+
+### 7.1 无 AI 冒烟测试（Windows，CATIA 已启动）
+
+```powershell
+python scripts\export_step_smoke.py
+```
+
+它会一次跑完「建模 → 保存 CATPart → 导出 STEP → 回读验证」，输出到项目下 `out\`。关键字段：
+
+```
+② 导出/回读证据：
+    catpart_saved         : True
+    step_written          : True
+    step_size_bytes       : 12345
+    source_volume_mm3     : 120000.0
+    reimported_volume_mm3 : 120000.0...
+    volume_match          : True
+    relative_error        : ~0.0
+
+判定： ✅ 交付合格（建模 + STEP 回读均通过）
+```
+
+- `step_written=True` → STEP 文件真实落盘（实时文件验证）。
+- `volume_match=True` → STEP 回读体积与原始吻合（容差 1%）。
+
+> 若 `reimported_volume_mm3` 为 `null`：说明 STEP 在你环境打开成了 Product 或结构不同，回读测量没取到值（不影响导出本身）。把情况贴来，我补上 Product 遍历测量。
+
+### 7.2 让 AI 交付
+
+对 AI 说：**"把刚才的长方体导出成 STEP 并验证。"**
+它应调用 `export_step_and_verify(step_path=...)`，根据 `step_written` / `volume_match` 回报是否交付合格。
+
+至此，工程交付物齐备：**可编辑 `.CATPart` + 中性 `.STEP` + 验证证据**。
+
+### 7.3 再下一步
+
+1. 加 `measure_*` 只读测量族，扩充证据类工具。
+2. 引入超时熔断 + 会话心跳看门狗（1、3 号风险）。
+3. 扩到 Pocket / Fillet 等更多 Part Design 特征。
+4. STEP 回读支持 Product 结构（多体/装配）。
