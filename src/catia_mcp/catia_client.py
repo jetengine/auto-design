@@ -260,12 +260,26 @@ class CatiaClient:
         # 3) 安全保存 CATPart（可选）
         catpart_saved = False
         if catpart_path is not None:
+            final_catpart_path = catpart_path
             try:
-                part_doc.SaveAs(catpart_path)
+                part_doc.SaveAs(final_catpart_path)
             except pythoncom.com_error:  # type: ignore[attr-defined]
-                catpart_saved = False
+                # 处理同名冲突：如果当前会话中已有同名项，则生成唯一文件名后重试一次
+                head, tail = os.path.split(catpart_path)
+                name, ext = os.path.splitext(tail)
+                unique_path = os.path.join(head, f"{name}_retry{ext}")
+                try:
+                    part_doc.SaveAs(unique_path)
+                    final_catpart_path = unique_path
+                    catpart_saved = os.path.isfile(unique_path) and os.path.getsize(unique_path) > 0
+                except pythoncom.com_error:
+                    catpart_saved = False
+                    final_catpart_path = None
             else:
-                catpart_saved = os.path.isfile(catpart_path) and os.path.getsize(catpart_path) > 0
+                catpart_saved = os.path.isfile(final_catpart_path) and os.path.getsize(final_catpart_path) > 0
+
+            if final_catpart_path is not None and final_catpart_path != catpart_path:
+                catpart_path = final_catpart_path
 
         # 4) 导出 STEP
         try:
