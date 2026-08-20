@@ -1,0 +1,33 @@
+[project]
+name = "catia-mcp"
+version = "0.0.1"
+description = "AI Agent 通过 MCP 驱动 CATIA V5 三维建模"
+requires-python = ">=3.10"
+readme = "README.md"
+
+# 说明：
+#   pywin32 只能在 Windows 安装成功，Mac / Linux 上会被 pip 拒绝 —— 这是预期的。
+#   开发建议：在 Mac 上编辑代码 + 提交，在 Windows 上安装依赖 + 运行。
+dependencies = [
+    "pywin32; sys_platform == 'win32'",
+]
+
+[project.optional-dependencies]
+# MCP server 依赖，等 Hello World 通了再启用
+mcp = [
+    "mcp>=1.0.0",
+]
+dev = [
+    "ruff",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
