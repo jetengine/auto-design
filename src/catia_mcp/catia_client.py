@@ -260,11 +260,33 @@ class CatiaClient:
         # 3) 安全保存 CATPart（可选）
         catpart_saved = False
         if catpart_path is not None:
-            part_doc.SaveAs(catpart_path)
-            catpart_saved = os.path.isfile(catpart_path) and os.path.getsize(catpart_path) > 0
+            try:
+                part_doc.SaveAs(catpart_path)
+            except pythoncom.com_error:  # type: ignore[attr-defined]
+                catpart_saved = False
+            else:
+                catpart_saved = os.path.isfile(catpart_path) and os.path.getsize(catpart_path) > 0
 
         # 4) 导出 STEP
-        part_doc.ExportData(step_path, "stp")
+        try:
+            part_doc.ExportData(step_path, "stp")
+        except pythoncom.com_error:  # type: ignore[attr-defined]
+            step_written = False
+            step_size = None
+            reimported_vol = None
+            match = None
+            rel_err = None
+            return ExportResult(
+                catpart_path=catpart_path,
+                catpart_saved=catpart_saved,
+                step_path=step_path,
+                step_written=False,
+                step_size_bytes=None,
+                source_volume_mm3=source_vol,
+                reimported_volume_mm3=None,
+                volume_match=None,
+                relative_error=None,
+            )
 
         # 5) 实时文件验证：确认 STEP 真的写出来了
         step_written = os.path.isfile(step_path) and os.path.getsize(step_path) > 0
