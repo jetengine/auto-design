@@ -97,8 +97,76 @@
 
 ---
 
-## 5. 下一步（Hello World 通过之后）
+## 5. MCP Server —— 第一个工具 `get_catia_session`
 
-1. 把 `session_info()` 包成第一个 MCP tool：`get_catia_version`。
-2. 引入 MCP server 骨架（`pip install "catia-mcp[mcp]"`）。
-3. 用 VS Code 的 MCP 客户端 或 Claude Desktop 挂上这个 server，做首个"AI 问 CATIA 版本"的端到端 demo。
+Hello World 通过后，我们把 `session_info()` 包成了 MCP 工具。架构：
+
+```
+MCP client (Claude Desktop / VS Code)
+        │  stdio + JSON-RPC
+        ▼
+   catia-mcp server (本项目)
+        │  submit 到单 STA 线程
+        ▼
+   ComWorker（独占 STA 线程 + 唯一 CATIA 连接）
+        │  COM
+        ▼
+   CATIA V5
+```
+
+> **为什么要 ComWorker**：CATIA COM 对象是单元线程（STA）绑定的，MCP 框架的回调可能在别的线程跑。所有 CATIA 调用都排队到这一个 STA 线程串行执行 —— 这就是"单 STA 串行 COM"的落地。53 个工具将来全部复用它。
+
+### 5.1 安装 / 更新依赖（Windows）
+
+```powershell
+cd C:\Users\CNB0K20060\Desktop\AutoDesign\auto-design   # 你的实际路径
+.\.venv\Scripts\Activate.ps1
+pip install -e .    # 现在会一并装上 mcp
+```
+
+### 5.2 手动冒烟测试（不接 AI，先确认 server 能跑）
+
+先启动 CATIA，再：
+
+```powershell
+python -c "from catia_mcp.com_worker import ComWorker; w=ComWorker(); w.start(); print(w.call(lambda c: c.session_info())); w.stop()"
+```
+
+能打印出 `CatiaSessionInfo(...)` 就说明 STA worker + COM 链路 OK。
+
+### 5.3 挂到 MCP 客户端
+
+**Claude Desktop**：编辑 `%APPDATA%\Claude\claude_desktop_config.json`：
+
+```json
+{
+  "mcpServers": {
+    "catia": {
+      "command": "C:\\Users\\CNB0K20060\\Desktop\\AutoDesign\\auto-design\\.venv\\Scripts\\catia-mcp.exe"
+    }
+  }
+}
+```
+
+**VS Code**（`.vscode/mcp.json` 或用户设置）：
+
+```json
+{
+  "servers": {
+    "catia": {
+      "type": "stdio",
+      "command": "C:\\Users\\CNB0K20060\\Desktop\\AutoDesign\\auto-design\\.venv\\Scripts\\catia-mcp.exe"
+    }
+  }
+}
+```
+
+> 路径换成你机器上 `catia-mcp.exe` 的实际位置（`pip install -e .` 后在 venv 的 `Scripts` 目录里）。
+
+启动 CATIA → 重启 MCP 客户端 → 问它 **"CATIA 现在是什么版本、打开了哪个文档？"**，它应当调用 `get_catia_session` 并如实回答。
+
+### 5.4 再下一步
+
+1. 加只读测量工具（`measure_*`），继续零风险扩充证据类工具。
+2. 再加第一个**写操作**：新建 Part + 画长方体 Pad（进入"检查证据 → 迭代修复"闭环）。
+3. 引入超时熔断 + 会话心跳看门狗（可行性分析里的 1、3 号风险）。

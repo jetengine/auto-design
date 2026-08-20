@@ -10,16 +10,16 @@ readme = "README.md"
 #   开发建议：在 Mac 上编辑代码 + 提交，在 Windows 上安装依赖 + 运行。
 dependencies = [
     "pywin32; sys_platform == 'win32'",
+    "mcp>=1.0.0",
 ]
 
 [project.optional-dependencies]
-# MCP server 依赖，等 Hello World 通了再启用
-mcp = [
-    "mcp>=1.0.0",
-]
 dev = [
     "ruff",
 ]
+
+[project.scripts]
+catia-mcp = "catia_mcp.server:main"
 
 [build-system]
 requires = ["setuptools>=68"]
