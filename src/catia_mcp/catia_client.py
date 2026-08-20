@@ -281,30 +281,41 @@ class CatiaClient:
             if final_catpart_path is not None and final_catpart_path != catpart_path:
                 catpart_path = final_catpart_path
 
-        # 4) 导出 STEP
-        try:
-            part_doc.ExportData(step_path, "stp")
-        except pythoncom.com_error:  # type: ignore[attr-defined]
-            step_written = False
-            step_size = None
-            reimported_vol = None
-            match = None
-            rel_err = None
-            return ExportResult(
-                catpart_path=catpart_path,
-                catpart_saved=catpart_saved,
-                step_path=step_path,
-                step_written=False,
-                step_size_bytes=None,
-                source_volume_mm3=source_vol,
-                reimported_volume_mm3=None,
-                volume_match=None,
-                relative_error=None,
-            )
+        # 4) 导出 STEP（文件名冲突/写入状态是常见失败点，做一次重试 + 唯一名兜底）
+        step_written = False
+        step_size = None
+        final_step_path = step_path
+        if not self._export_step_with_retry(part_doc, step_path):
+            head, tail = os.path.split(step_path)
+            name, ext = os.path.splitext(tail)
+            retry_path = os.path.join(head, f"{name}_retry{ext}")
+            if self._export_step_with_retry(part_doc, retry_path):
+                final_step_path = retry_path
+                step_written = os.path.isfile(final_step_path) and os.path.getsize(final_step_path) > 0
+                step_size = os.path.getsize(final_step_path) if os.path.isfile(final_step_path) else None
+            else:
+                reimported_vol = None
+                match = None
+                rel_err = None
+                return ExportResult(
+                    catpart_path=catpart_path,
+                    catpart_saved=catpart_saved,
+                    step_path=final_step_path,
+                    step_written=False,
+                    step_size_bytes=None,
+                    source_volume_mm3=source_vol,
+                    reimported_volume_mm3=None,
+                    volume_match=None,
+                    relative_error=None,
+                )
+        else:
+            step_written = os.path.isfile(step_path) and os.path.getsize(step_path) > 0
+            step_size = os.path.getsize(step_path) if os.path.isfile(step_path) else None
+            final_step_path = step_path
 
         # 5) 实时文件验证：确认 STEP 真的写出来了
-        step_written = os.path.isfile(step_path) and os.path.getsize(step_path) > 0
-        step_size = os.path.getsize(step_path) if os.path.isfile(step_path) else None
+        if step_written:
+            step_size = os.path.getsize(final_step_path) if os.path.isfile(final_step_path) else None
 
         # 6) STEP 回读：重新打开导入并测体积
         reimported_vol: Optional[float] = None
@@ -329,6 +340,25 @@ class CatiaClient:
             volume_match=match,
             relative_error=rel_err,
         )
+
+    # ------------------------------------------------------------------
+    def _export_step_with_retry(self, part_doc, step_path: str) -> bool:
+        """STEP 导出重试：先清理旧文件，再尝试一组标准格式名。"""
+        candidates = [
+            (step_path, "stp"),
+            (step_path, "STEP"),
+            (step_path, "STP"),
+        ]
+        for target_path, fmt in candidates:
+            try:
+                if os.path.exists(target_path):
+                    os.remove(target_path)
+                part_doc.ExportData(target_path, fmt)
+                if os.path.isfile(target_path) and os.path.getsize(target_path) > 0:
+                    return True
+            except (pythoncom.com_error, OSError):  # type: ignore[attr-defined]
+                continue
+        return False
 
     # ------------------------------------------------------------------
     def _validate_output_path(self, path: str, allowed_ext: set[str]) -> str:
