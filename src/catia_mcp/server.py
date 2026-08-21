@@ -334,6 +334,47 @@ def add_fillet(
     return asdict(result)
 
 
+@mcp.tool()
+def create_box_family(
+    variants: list[dict],
+    output_dir: str | None = None,
+) -> dict:
+    """按参数表一次生成一族长方体（可选倒角），每个变体各自验证体积。
+
+    这是把前面所有单件能力**放大到规模**的工具：做 20 个变体和做 1 个，
+    对你来说心智负担一样，但对人来说是 20 次重复劳动 + 20 次出错机会。
+
+    参数：
+        variants: 变体列表，每项：
+            length_mm / width_mm / height_mm : 必填，正数
+            fillet_radius_mm                 : 可选，需满足 2r < 最短边
+            name                             : 可选，用作 Part 名与文件名
+            一次最多 50 个（批量期间独占 CATIA 链路，太长会让其它调用一直排队）
+        output_dir: 给了就每个变体**存盘后关闭**，会话保持干净；
+                    不给就全部留在 CATIA 里（注意 20 个变体 = 20 个文档）
+
+    返回：
+        requested / succeeded / failed: 请求数、成功数、失败数
+        all_verified:                   是否全部建成且体积对上（一眼定论）
+        elapsed_s:                      总耗时
+        documents_left_open:            没存盘、留在会话里的文档数
+        variants:                       每个变体一条明细，**失败的也有**，
+                                        含 ok / relative_error / error
+
+    读法：先看 all_verified；为 false 时再到 variants 里找 ok=false 的那几条，
+    每条都带自己的失败原因，不用重跑整批去定位。
+    """
+
+    def _job(client: CatiaClient):
+        return client.create_box_family(variants=variants, output_dir=output_dir)
+
+    # 超时按变体数给，而不是拍一个固定值：20 个变体本来就该比 1 个等得久，
+    # 用固定值要么冤枉大批次，要么给小批次留了没意义的长窗口。
+    budget = min(60.0 + 20.0 * len(variants or []), 900.0)
+    result = _worker.call(_job, timeout=budget, label=f"create_box_family(n={len(variants or [])})")
+    return asdict(result)
+
+
 
 @mcp.tool()
 def export_step_and_verify(

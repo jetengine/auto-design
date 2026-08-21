@@ -13,6 +13,7 @@ from __future__ import annotations
 import math
 import os
 import sys
+import time
 from dataclasses import dataclass
 from typing import Optional
 
@@ -155,6 +156,41 @@ class InspectResult:
     body_count: int
     active_document_name: Optional[str] = None
     errors: Optional[list] = None
+
+
+@dataclass
+class VariantResult:
+    """族里单个变体的结果。**失败的变体也有一条**，不会被悄悄跳过。"""
+
+    index: int                            # 在请求列表里的位置（对得上号才好追）
+    name: Optional[str]
+    length_mm: float
+    width_mm: float
+    height_mm: float
+    fillet_radius_mm: Optional[float]
+    ok: bool                              # 建模 + 验证是否全部通过
+    document_name: Optional[str] = None
+    saved_path: Optional[str] = None
+    expected_volume_mm3: Optional[float] = None
+    measured_volume_mm3: Optional[float] = None
+    volume_match: Optional[bool] = None
+    relative_error: Optional[float] = None
+    objects_filleted: Optional[int] = None
+    error: Optional[str] = None           # 失败原因（只有失败时有）
+
+
+@dataclass
+class FamilyResult:
+    """批量建族的汇总。**汇总本身才是产物** —— 20 份原始返回没人看得完。"""
+
+    requested: int
+    succeeded: int
+    failed: int
+    all_verified: bool                    # 全部变体都建成且体积对上
+    elapsed_s: float
+    output_dir: Optional[str] = None
+    documents_left_open: int = 0          # 没存盘就留在 CATIA 里的数量（会话污染量）
+    variants: Optional[list] = None
 
 
 class CatiaClient:
@@ -878,6 +914,206 @@ class CatiaClient:
             edge_candidates=candidate_count,
             target_errors=target_errors or None,
         )
+
+    # ------------------------------------------------------------------
+    # 批量：一次生成一族变体
+    # ------------------------------------------------------------------
+    MAX_FAMILY_VARIANTS = 50
+
+    def create_box_family(
+        self,
+        variants: list,
+        output_dir: Optional[str] = None,
+        volume_tolerance: float = 1e-3,
+    ) -> FamilyResult:
+        """按参数表一次建出一族长方体（可选倒角），每个变体各自验证。
+
+        ── 这一步换的是量级，不是功能 ──
+        前面九个工具单次调用都可靠了，但「AI 帮我设计」和「AI 帮我点鼠标」的差别，
+        恰恰在于能不能**一次生成并验证 20 个变体**。人做 20 遍会累、会漏、会在第
+        13 个上手滑；这里做 20 遍和做 1 遍的心智负担一样。
+
+        ── 批量特有的三个设计点 ──
+        1. **参数错 → 整批不动；运行时错 → 继续往下**。这两类失败的正确反应相反：
+           规格写错（负数尺寸、2r ≥ 最短边）在碰 CATIA 之前就能查出来，那就一个
+           都别建 —— 建了 6 个再报错，等于留下 6 份要手工收拾的垃圾，而且**批量
+           的每一步都不可回滚**。反过来，第 7 个在 CATIA 里跑挂了（几何求解失败
+           之类），不该让第 8~20 个白等，那种失败必须就地记下继续走。
+        2. **失败的变体也要有一条记录**。悄悄跳过 = 汇总里 20 变 19，没人会发现
+           少了哪个。所以 `variants` 里条数恒等于请求数，靠 `ok` 区分。
+        3. **汇总才是产物**。20 份原始返回没人看得完，AI 也会被淹没。所以先给
+           `succeeded / failed / all_verified`，明细放后面备查。
+
+        参数：
+            variants: [{"length_mm", "width_mm", "height_mm",
+                        "fillet_radius_mm"(可选), "name"(可选)}, ...]
+            output_dir: 给了就每个变体存盘后**关掉**；不给就全部留在 CATIA 里
+            volume_tolerance: 单个变体的体积相对误差容差
+        """
+        if not isinstance(variants, list) or not variants:
+            raise ValueError("variants 必须是非空列表。")
+        if len(variants) > self.MAX_FAMILY_VARIANTS:
+            raise ValueError(
+                f"一次最多 {self.MAX_FAMILY_VARIANTS} 个变体，收到 {len(variants)} 个。\n"
+                "这个上限是保护单 STA 链路的：批量期间整条链路被独占，"
+                "太长的批次会让健康检查和其它调用一直排队。请分批提交。"
+            )
+
+        specs = [self._parse_variant(i, v) for i, v in enumerate(variants)]
+
+        out_dir = None
+        if output_dir:
+            out_dir = os.path.abspath(os.path.expanduser(str(output_dir)))
+            os.makedirs(out_dir, exist_ok=True)
+
+        app = self._require_app()
+        started = time.monotonic()
+        results: list = []
+        left_open = 0
+
+        for spec in specs:
+            idx, name, L, W, H, r = spec
+            try:
+                box = self.create_box(
+                    length_mm=L, width_mm=W, height_mm=H,
+                    part_name=name, volume_tolerance=volume_tolerance,
+                )
+                expected = L * W * H
+                measured = box.measured_volume_mm3
+                ok = bool(box.update_ok and box.volume_match)
+                filleted = None
+
+                if r:
+                    fil = self.add_fillet(
+                        radius_mm=r, box_length_mm=L, box_width_mm=W,
+                        box_height_mm=H, volume_tolerance=volume_tolerance,
+                    )
+                    expected -= self._box_fillet_removed_mm3(L, W, H, r)
+                    measured = fil.volume_after_mm3
+                    filleted = fil.objects_filleted
+                    ok = ok and bool(fil.update_ok and fil.volume_match)
+
+                rel_err = None
+                match = None
+                if measured is not None and expected > 0:
+                    rel_err = abs(measured - expected) / expected
+                    match = rel_err <= volume_tolerance
+                    ok = ok and match
+
+                saved_path = None
+                if out_dir:
+                    saved_path = self._save_and_close(app, box.document_name, out_dir, name, idx)
+                    if saved_path is None:
+                        ok = False
+                else:
+                    left_open += 1
+
+                results.append(
+                    VariantResult(
+                        index=idx, name=name,
+                        length_mm=L, width_mm=W, height_mm=H, fillet_radius_mm=r,
+                        ok=ok,
+                        document_name=box.document_name,
+                        saved_path=saved_path,
+                        expected_volume_mm3=expected,
+                        measured_volume_mm3=measured,
+                        volume_match=match,
+                        relative_error=rel_err,
+                        objects_filleted=filleted,
+                        error=None if ok else "验证未通过，见 volume_match / relative_error",
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001 —— 单个变体失败不拖垮整批
+                results.append(
+                    VariantResult(
+                        index=idx, name=name,
+                        length_mm=L, width_mm=W, height_mm=H, fillet_radius_mm=r,
+                        ok=False, error=str(exc),
+                    )
+                )
+
+        succeeded = sum(1 for v in results if v.ok)
+        return FamilyResult(
+            requested=len(specs),
+            succeeded=succeeded,
+            failed=len(results) - succeeded,
+            all_verified=succeeded == len(results),
+            elapsed_s=round(time.monotonic() - started, 3),
+            output_dir=out_dir,
+            documents_left_open=left_open,
+            variants=results,
+        )
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _parse_variant(index: int, spec) -> tuple:
+        """把一条变体规格校验成 (index, name, L, W, H, r)。不合法立刻抛。
+
+        错误信息一律带上是第几个 —— 一张 20 行的表里说「尺寸必须为正」而不说
+        哪一行，等于没说。
+        """
+        where = f"第 {index + 1} 个变体"
+        if not isinstance(spec, dict):
+            raise ValueError(f"{where}：必须是对象，收到 {type(spec).__name__}。")
+        try:
+            L = float(spec["length_mm"])
+            W = float(spec["width_mm"])
+            H = float(spec["height_mm"])
+        except KeyError as exc:
+            raise ValueError(f"{where}：缺少必填项 {exc.args[0]!r}。") from exc
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{where}：长宽高必须是数字。原始错误：{exc}") from exc
+
+        if min(L, W, H) <= 0:
+            raise ValueError(f"{where}：长宽高必须为正数，收到 {(L, W, H)}。")
+
+        r = spec.get("fillet_radius_mm")
+        if r is not None:
+            r = float(r)
+            if r <= 0:
+                raise ValueError(f"{where}：倒角半径必须为正数，收到 {r}。")
+            if 2 * r >= min(L, W, H):
+                raise ValueError(
+                    f"{where}：倒角半径 {r} 过大 —— 2r 必须小于最短边 {min(L, W, H)}，"
+                    "否则圆角会吃穿整个截面。"
+                )
+
+        name = spec.get("name")
+        return index, (str(name) if name else None), L, W, H, r
+
+    def _save_and_close(self, app, document_name, out_dir: str, name, index: int):
+        """把变体存盘并关闭；成功返回路径，失败返回 None。
+
+        存盘不只是留档 —— 它同时解决了批量最现实的副作用：**20 个变体就是 20 个
+        文档**，全留在会话里会把 CATIA 塞满，后续任何「按名字找文档」都变得难用。
+        所以给了 output_dir 就存完即关，会话保持干净。
+        """
+        # 文件名来自调用方（可能是 AI 生成的），必须消毒后才能拼进路径：
+        # 否则 name="../../x" 就能写到 output_dir 之外去。
+        stem = self._safe_stem(name) or f"Variant_{index + 1:02d}"
+        path = self._validate_output_path(os.path.join(out_dir, stem + ".CATPart"), {".catpart"})
+        if os.path.commonpath([out_dir, path]) != out_dir:
+            raise ValueError(f"变体 {index + 1} 的输出路径逃出了 output_dir。")
+
+        doc = self._find_document(app, document_name)
+        try:
+            doc.SaveAs(path)
+        except pythoncom.com_error:  # type: ignore[attr-defined]
+            return None
+        if not (os.path.isfile(path) and os.path.getsize(path) > 0):
+            return None
+        try:
+            doc.Close()
+        except pythoncom.com_error:  # type: ignore[attr-defined]
+            pass  # 关不掉不影响「已存盘」这个事实
+        return path
+
+    @staticmethod
+    def _safe_stem(name) -> str:
+        """只保留字母数字、下划线、短横 —— 路径分隔符和 `..` 一律出局。"""
+        if not name:
+            return ""
+        return "".join(ch for ch in str(name) if ch.isalnum() or ch in "_-")[:60]
 
     def _add_fillet_on_edges(self, part_doc, part, radius_mm: float, propagation: str):
         """拾取实体的全部边并倒角。返回 (fillet, strategy, filleted, candidates, errors)。
