@@ -138,6 +138,65 @@ def get_catia_session() -> dict:
 
 
 @mcp.tool()
+def inspect_document(document_name: str | None = None) -> dict:
+    """列出某个 Part 文档里有哪些 Body、每个 Body 里有哪些特征（只读）。
+
+    这是测量的入口：`measure_body` 需要 body 名字，而你无从猜起，先用它看清结构。
+
+    参数：
+        document_name: 文档名（如 "Part3.CATPart"）；不传则用当前活动文档
+
+    返回：
+        document_name:        实际检查的文档
+        open_documents:       当前打开的全部文档名（传错名字时照着改）
+        is_part:              是否是零件文档；false 时（Product/Drawing）无法按零件测量
+        bodies:               [{name, shape_count, shapes: [特征名...]}]
+        body_count:           Body 数量
+        active_document_name: 当前活动文档
+
+    只做属性遍历，不会改动 CATIA 的任何状态。
+    """
+
+    def _job(client: CatiaClient):
+        return client.inspect_document(document_name=document_name)
+
+    result = _worker.call(_job, timeout=60.0, label="inspect_document")
+    return asdict(result)
+
+
+@mcp.tool()
+def measure_body(
+    document_name: str | None = None,
+    body_name: str | None = None,
+) -> dict:
+    """测量一个已存在实体的体积、表面积、重心（只读，不改模型）。
+
+    与其它工具的根本区别：它**不要求这个模型是你造的**。手工建的、别人发来的、
+    上一轮造的，都能测 —— 这是唯一一个能对「既有模型」下结论的能力。
+
+    参数：
+        document_name: 文档名；不传则用当前活动文档
+        body_name:     Body 名（如 "PartBody"）；不传则用第一个
+
+    返回：
+        volume_mm3:   体积（mm³）
+        area_mm2:     表面积（mm²）
+        cog_mm:       重心坐标 [x, y, z]（mm）
+        cog_strategy: 重心是靠哪种 COM 调用姿势读到的（诊断用）
+        errors:       某一项测不出来时的原始报错（其余项照常返回）
+
+    为什么三项都给：体积单独一项验证力有限 —— 拉伸方向反了、长宽写反了，
+    体积可以一模一样，但**重心和表面积会露馅**。三项同时对上才算把几何钉死。
+    """
+
+    def _job(client: CatiaClient):
+        return client.measure_body(document_name=document_name, body_name=body_name)
+
+    result = _worker.call(_job, timeout=60.0, label="measure_body")
+    return asdict(result)
+
+
+@mcp.tool()
 def create_box(
     length_mm: float,
     width_mm: float,

@@ -125,6 +125,37 @@ class ExportResult:
     format_used: Optional[str] = None     # 实际成功使用的中性格式（如 stp / igs）
 
 
+@dataclass
+class MeasureResult:
+    """对**任意已存在实体**的只读测量证据。
+
+    和 BoxResult / PocketResult / FilletResult 的关键区别：那些是「我造完了，
+    我自己证明我造对了」；这个是「这东西在这儿，它到底是什么样」——**不需要
+    知道它是谁造的**。手工建的模、同事发来的、上一轮 AI 造的，都能测。
+    """
+
+    document_name: str
+    body_name: str
+    volume_mm3: Optional[float]           # 体积
+    area_mm2: Optional[float]             # 表面积 —— 与体积互相独立的第二条证据
+    cog_mm: Optional[tuple]               # 重心 (x, y, z)，第三条独立证据
+    cog_strategy: Optional[str] = None    # GetCOG 是靠哪种调用姿势成功的（自证）
+    errors: Optional[list] = None         # 各项测量失败时的原始 COM 报错
+
+
+@dataclass
+class InspectResult:
+    """文档结构清单 —— 先看清有什么，才谈得上测量。"""
+
+    document_name: str
+    open_documents: list                  # 当前打开的全部文档名（找错文档时的自救线索）
+    is_part: bool                         # 不是 Part（如 Product/Drawing）时后续测量无意义
+    bodies: list                          # [{"name", "shape_count", "shapes": [...]}]
+    body_count: int
+    active_document_name: Optional[str] = None
+    errors: Optional[list] = None
+
+
 class CatiaClient:
     """连接到本机上已经打开的 CATIA 会话。
 
@@ -200,6 +231,227 @@ class CatiaClient:
             document_count=doc_count,
             caption=caption,
         )
+
+    # ------------------------------------------------------------------
+    # 只读测量族 —— 唯一一组「不靠自己造」也能给结论的能力
+    # ------------------------------------------------------------------
+    def inspect_document(self, document_name: Optional[str] = None) -> InspectResult:
+        """列出文档里有哪些 Body、每个 Body 里有哪些特征。
+
+        为什么先要有它：`measure_body` 需要一个 body 名字，而 AI 无从猜起。
+        没有这一步，测量族就只能测「自己刚造的东西」，等于没有解决问题。
+
+        全程只读属性遍历，不碰 Selection、不碰几何，不会改动 CATIA 任何状态。
+        """
+        app = self._require_app()
+        errors: list = []
+
+        open_docs = self._list_document_names(app)
+        active_name = None
+        try:
+            active_name = str(app.ActiveDocument.Name)
+        except pythoncom.com_error:  # type: ignore[attr-defined]
+            pass
+
+        doc = self._find_document(app, document_name)
+
+        try:
+            part = doc.Part
+        except (AttributeError, pythoncom.com_error):  # type: ignore[attr-defined]
+            # Product / Drawing / STEP 导入件都可能走到这里。如实报告，不假装能测。
+            return InspectResult(
+                document_name=str(doc.Name),
+                open_documents=open_docs,
+                is_part=False,
+                bodies=[],
+                body_count=0,
+                active_document_name=active_name,
+                errors=["该文档没有 .Part（可能是 Product / Drawing），无法按零件测量。"],
+            )
+
+        bodies: list = []
+        try:
+            collection = part.Bodies
+            for i in range(1, int(collection.Count) + 1):
+                body = collection.Item(i)
+                shapes: list = []
+                try:
+                    shape_col = body.Shapes
+                    for j in range(1, int(shape_col.Count) + 1):
+                        shapes.append(str(shape_col.Item(j).Name))
+                except pythoncom.com_error as exc:  # type: ignore[attr-defined]
+                    errors.append(f"读取 {body.Name} 的特征列表失败: {exc}")
+                bodies.append(
+                    {"name": str(body.Name), "shape_count": len(shapes), "shapes": shapes}
+                )
+        except pythoncom.com_error as exc:  # type: ignore[attr-defined]
+            errors.append(f"遍历 Bodies 失败: {exc}")
+
+        return InspectResult(
+            document_name=str(doc.Name),
+            open_documents=open_docs,
+            is_part=True,
+            bodies=bodies,
+            body_count=len(bodies),
+            active_document_name=active_name,
+            errors=errors or None,
+        )
+
+    def measure_body(
+        self,
+        document_name: Optional[str] = None,
+        body_name: Optional[str] = None,
+    ) -> MeasureResult:
+        """测量一个实体的体积、表面积、重心。三者互相独立。
+
+        ── 为什么不能只测体积 ──
+        前面每个写操作都用体积自证，但**体积单独一项验证力有限**：
+            · Pad 方向反了 → 体积一模一样，重心却跑到了 z 的另一侧
+            · 尺寸写反（40×30 vs 30×40）→ 体积一样，重心不一样
+            · 形状完全不同但体积恰好相同 → 表面积会露馅
+        体积 + 表面积 + 重心三项同时对上，才算把几何真正钉死。这是**第二条
+        独立证据轴**，而不是把同一个数再读一遍。
+
+        ── 单位 ──
+        CATIA 的 Measurable 走 SI：体积 m³、面积 m²、坐标 m。
+        所以换算是 ×1e9 / ×1e6 / ×1e3。这个换算是否正确，冒烟测试一跑就知道
+        （错了会差整整 6 个数量级，不可能看不出来）。
+        """
+        app = self._require_app()
+        errors: list = []
+
+        doc = self._find_document(app, document_name)
+        try:
+            part = doc.Part
+        except (AttributeError, pythoncom.com_error) as exc:  # type: ignore[attr-defined]
+            raise RuntimeError(
+                f"文档 {doc.Name} 没有 .Part（可能是 Product / Drawing），无法测量。"
+            ) from exc
+
+        body = self._find_body(part, body_name)
+
+        try:
+            spa = doc.GetWorkbench("SPAWorkbench")
+            ref = part.CreateReferenceFromObject(body)
+            measurable = spa.GetMeasurable(ref)
+        except pythoncom.com_error as exc:  # type: ignore[attr-defined]
+            raise RuntimeError(
+                f"拿不到 {body.Name} 的 Measurable，测量无法进行。原始错误：{exc}"
+            ) from exc
+
+        volume = self._read_si(measurable, "Volume", 1e9, errors)
+        area = self._read_si(measurable, "Area", 1e6, errors)
+        cog, cog_strategy = self._read_cog_mm(measurable, errors)
+
+        return MeasureResult(
+            document_name=str(doc.Name),
+            body_name=str(body.Name),
+            volume_mm3=volume,
+            area_mm2=area,
+            cog_mm=cog,
+            cog_strategy=cog_strategy,
+            errors=errors or None,
+        )
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _list_document_names(app) -> list:
+        try:
+            docs = app.Documents
+            return [str(docs.Item(i).Name) for i in range(1, int(docs.Count) + 1)]
+        except pythoncom.com_error:  # type: ignore[attr-defined]
+            return []
+
+    def _find_document(self, app, document_name: Optional[str]):
+        """按名字找文档；不给名字就用活动文档。
+
+        找不到时把「现在开着哪些」一并报出来 —— 光说「没找到」等于让人重猜。
+        """
+        if not document_name:
+            try:
+                return app.ActiveDocument
+            except pythoncom.com_error as exc:  # type: ignore[attr-defined]
+                raise RuntimeError("CATIA 里没有活动文档，请先打开一个 Part。") from exc
+
+        docs = app.Documents
+        target = str(document_name).strip().lower()
+        for i in range(1, int(docs.Count) + 1):
+            doc = docs.Item(i)
+            if str(doc.Name).strip().lower() == target:
+                return doc
+        available = self._list_document_names(app)
+        raise RuntimeError(
+            f"没找到名为 {document_name!r} 的文档。当前打开的是：{available}"
+        )
+
+    @staticmethod
+    def _find_body(part, body_name: Optional[str]):
+        """按名字找 Body；不给名字就用第 1 个（PartBody）。"""
+        bodies = part.Bodies
+        count = int(bodies.Count)
+        if count == 0:
+            raise RuntimeError("该 Part 里一个 Body 都没有。")
+        if not body_name:
+            return bodies.Item(1)
+
+        target = str(body_name).strip().lower()
+        names = []
+        for i in range(1, count + 1):
+            body = bodies.Item(i)
+            name = str(body.Name)
+            names.append(name)
+            if name.strip().lower() == target:
+                return body
+        raise RuntimeError(f"没找到名为 {body_name!r} 的 Body。该 Part 里有：{names}")
+
+    @staticmethod
+    def _read_si(measurable, prop: str, factor: float, errors: list) -> Optional[float]:
+        """读一个 SI 单位的标量属性并换算。失败记错误返回 None，不打断其余项。
+
+        分开读、分开记：体积测不出不该连累面积也没有 —— 三条证据里能拿到几条
+        就报几条，剩下的说明为什么拿不到。
+        """
+        try:
+            return float(getattr(measurable, prop)) * factor
+        except (AttributeError, pythoncom.com_error) as exc:  # type: ignore[attr-defined]
+            errors.append(f"{prop}: {exc}")
+            return None
+
+    @staticmethod
+    def _read_cog_mm(measurable, errors: list):
+        """读重心，返回 ((x, y, z) mm, 生效的调用姿势)。
+
+        `GetCOG` 是**出参数组**（CATSafeArrayVariant），不是返回值。pywin32 传
+        出参数组有两种写法，且哪种能用取决于 pywin32 版本对 byref VARIANT 的
+        支持。所以按序试，并把生效的那种记进结果 —— 换台机器出问题时，
+        这一个字段就能说明是不是 marshalling 姿势变了。
+        """
+        # 姿势 A：显式 byref VARIANT（pywin32 对 CATIA 出参数组的标准解法）
+        try:
+            arr = win32com.client.VARIANT(
+                pythoncom.VT_ARRAY | pythoncom.VT_BYREF | pythoncom.VT_R8,
+                [0.0, 0.0, 0.0],
+            )
+            measurable.GetCOG(arr)
+            vals = [float(v) * 1e3 for v in arr.value]
+            if len(vals) >= 3:
+                return tuple(vals[:3]), "VARIANT(VT_ARRAY|VT_BYREF|VT_R8)"
+            errors.append(f"GetCOG(byref VARIANT): 只拿到 {len(vals)} 个分量")
+        except (AttributeError, pythoncom.com_error, ValueError, TypeError) as exc:  # type: ignore[attr-defined]
+            errors.append(f"GetCOG(byref VARIANT): {exc}")
+
+        # 姿势 B：直接传 list，靠 pywin32 自动 marshalling
+        try:
+            buf = [0.0, 0.0, 0.0]
+            out = measurable.GetCOG(buf)
+            vals = list(out) if out is not None else list(buf)
+            if len(vals) >= 3:
+                return tuple(float(v) * 1e3 for v in vals[:3]), "plain list"
+            errors.append(f"GetCOG(plain list): 只拿到 {len(vals)} 个分量")
+        except (AttributeError, pythoncom.com_error, ValueError, TypeError) as exc:  # type: ignore[attr-defined]
+            errors.append(f"GetCOG(plain list): {exc}")
+
+        return None, None
 
     # ------------------------------------------------------------------
     # 写操作（原生特征）
