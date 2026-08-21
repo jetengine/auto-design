@@ -249,3 +249,41 @@ python scripts\export_step_smoke.py
 2. 引入超时熔断 + 会话心跳看门狗（1、3 号风险）。
 3. 扩到 Pocket / Fillet 等更多 Part Design 特征。
 4. STEP 回读支持 Product 结构（多体/装配）。
+
+## 8. 端到端：AI 端 → CATIA 全链路
+
+前面的冒烟测试都是**进程内直接调 `ComWorker`**，绕过了 MCP 协议。这一节走**真实 MCP 协议**，与 Claude / VS Code Copilot 完全相同的路径：
+
+```
+MCP client ── stdio/JSON-RPC ──▶ catia_mcp.server ──▶ ComWorker(STA) ──▶ CATIA
+```
+
+### 8.1 可复现端到端测试（不依赖人在环）
+
+在 **Windows**、CATIA 已启动、已 `pip install -e .`：
+
+```powershell
+python scripts\mcp_client_smoke.py
+```
+
+脚本以子进程拉起 server，完成 `initialize` → 列工具 → 依次调 `get_catia_session` / `create_box` / `export_step_and_verify`，并打印每步证据。关键判定：
+
+```
+✅ MCP 协议握手成功（initialize 完成）
+✅ 发现工具：['get_catia_session', 'create_box', 'export_step_and_verify']
+...
+判定： ✅ 端到端链路跑通（MCP client → server → ComWorker → CATIA）
+```
+
+这一步只是把「LLM 决策调哪个工具」换成脚本写死的顺序，从而拿到确定性证据。
+
+### 8.2 接真正的 AI（VS Code Copilot / Claude）
+
+仓库已带 [.vscode/mcp.json](.vscode/mcp.json)（用 `${workspaceFolder}` 定位 venv 里的 `catia-mcp.exe`）。在 **Windows 上用 VS Code 打开本仓库**：
+
+1. 确保已 `pip install -e .`（venv 里生成了 `catia-mcp.exe`）；
+2. 启动 CATIA；
+3. 在 Copilot Chat 的 Agent 模式里启用 `catia` MCP server；
+4. 对 AI 说：**“看看 CATIA 现在什么状态，然后建个 100×60×20 的长方体并导出验证。”**
+
+AI 应依次调用 `get_catia_session` → `create_box` → `export_step_and_verify`，并根据返回证据回报是否交付合格。这就是完整价值主张的端到端演示。
