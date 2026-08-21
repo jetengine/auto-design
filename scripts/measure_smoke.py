@@ -185,7 +185,9 @@ def main() -> int:
         "\n判定：",
         "✅ 测量族合格（体积 / 表面积 / 重心三条独立证据均与精确解吻合）"
         if all_ok
-        else "⚠️ 需检查（重点看单位换算是否差 10^3/10^6，以及 cog_strategy）",
+        else "⚠️ 需检查 —— 看上面哪一项是 ❌：\n"
+        "      体积/表面积不对 → 多半是单位换算（差 10^3 / 10^6 会非常显眼）\n"
+        "      重心为 null     → 看 errors 里各姿势的原始报错，以及 cog_strategy",
     )
     return 0 if all_ok else 1
 

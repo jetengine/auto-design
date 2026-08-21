@@ -341,7 +341,7 @@ class CatiaClient:
 
         volume = self._read_si(measurable, "Volume", 1e9, errors)
         area = self._read_si(measurable, "Area", 1e6, errors)
-        cog, cog_strategy = self._read_cog_mm(measurable, errors)
+        cog, cog_strategy = self._read_cog_mm(measurable, errors, app)
 
         return MeasureResult(
             document_name=str(doc.Name),
@@ -418,38 +418,88 @@ class CatiaClient:
             return None
 
     @staticmethod
-    def _read_cog_mm(measurable, errors: list):
+    def _read_cog_mm(measurable, errors: list, app=None):
         """读重心，返回 ((x, y, z) mm, 生效的调用姿势)。
 
-        `GetCOG` 是**出参数组**（CATSafeArrayVariant），不是返回值。pywin32 传
-        出参数组有两种写法，且哪种能用取决于 pywin32 版本对 byref VARIANT 的
-        支持。所以按序试，并把生效的那种记进结果 —— 换台机器出问题时，
-        这一个字段就能说明是不是 marshalling 姿势变了。
-        """
-        # 姿势 A：显式 byref VARIANT（pywin32 对 CATIA 出参数组的标准解法）
-        try:
-            arr = win32com.client.VARIANT(
-                pythoncom.VT_ARRAY | pythoncom.VT_BYREF | pythoncom.VT_R8,
-                [0.0, 0.0, 0.0],
-            )
-            measurable.GetCOG(arr)
-            vals = [float(v) * 1e3 for v in arr.value]
-            if len(vals) >= 3:
-                return tuple(vals[:3]), "VARIANT(VT_ARRAY|VT_BYREF|VT_R8)"
-            errors.append(f"GetCOG(byref VARIANT): 只拿到 {len(vals)} 个分量")
-        except (AttributeError, pythoncom.com_error, ValueError, TypeError) as exc:  # type: ignore[attr-defined]
-            errors.append(f"GetCOG(byref VARIANT): {exc}")
+        ── 这里踩到的坑，比「调用失败」更值得记 ──
+        `GetCOG` 不是返回值，而是**出参数组**（`CATSafeArrayVariant`）。第一版
+        试了两种姿势，实测结果是：
 
-        # 姿势 B：直接传 list，靠 pywin32 自动 marshalling
+            byref VARIANT(VT_R8) → 直接报错 "Objects for SAFEARRAYS must be
+                                   sequences (of sequences), or a buffer object"
+            直接传 list          → **不报错，但返回全零**
+
+        第二种才是真正危险的那个：pywin32 把 list 按值传了进去，CATIA 写回的是
+        那份副本，我们读到的原 list 一个字节都没变。**它没有失败，它在说谎。**
+        一个静默返回错误数据的策略，比一个抛异常的策略危险得多 —— 后者会停下来，
+        前者会一路把错误数据带进结论里。
+
+        ── 对策：哨兵值 ──
+        缓冲区不填 0，填一个真实重心绝无可能取到的magic number。调用完如果三个
+        分量**还是哨兵值**，就证明 CATIA 根本没写回来，判为失败换下一种姿势。
+        不能简单地「见到 (0,0,0) 就当失败」—— 一个居中建模的零件重心本来就是原点，
+        那样会把正确结果误杀。哨兵值区分的是「没被写」而不是「值恰好是零」。
+        """
+        sentinel = -1.2345678901e9  # 真实重心（米）不可能取到这个量级
+
+        def _harvest(vals, label):
+            """把出参缓冲区换算成 mm；没被写回则返回 None 并记原因。"""
+            vals = [float(v) for v in (vals or [])]
+            if len(vals) < 3:
+                errors.append(f"GetCOG({label}): 只拿到 {len(vals)} 个分量")
+                return None
+            if all(v == sentinel for v in vals[:3]):
+                errors.append(f"GetCOG({label}): 出参没被写回（缓冲区仍是哨兵值）")
+                return None
+            return tuple(v * 1e3 for v in vals[:3])  # SI 米 → mm
+
+        # 姿势 A/B：byref VARIANT。CATSafeArrayVariant 的元素类型是 VARIANT，
+        # 所以先试 VT_VARIANT，再退回 VT_R8。
+        variant_kinds = (
+            ("VT_ARRAY|VT_BYREF|VT_VARIANT", pythoncom.VT_ARRAY | pythoncom.VT_BYREF | pythoncom.VT_VARIANT),
+            ("VT_ARRAY|VT_BYREF|VT_R8", pythoncom.VT_ARRAY | pythoncom.VT_BYREF | pythoncom.VT_R8),
+        )
+        for label, vt in variant_kinds:
+            try:
+                arr = win32com.client.VARIANT(vt, [sentinel, sentinel, sentinel])
+                measurable.GetCOG(arr)
+                got = _harvest(arr.value, label)
+                if got is not None:
+                    return got, f"VARIANT({label})"
+            except (AttributeError, pythoncom.com_error, ValueError, TypeError) as exc:  # type: ignore[attr-defined]
+                errors.append(f"GetCOG({label}): {exc}")
+
+        # 姿势 C：直接传 list。已知会静默说谎，靠哨兵拦住；留着是为了换机器时
+        # 万一 pywin32 行为不同，它能顶上。
         try:
-            buf = [0.0, 0.0, 0.0]
+            buf = [sentinel, sentinel, sentinel]
             out = measurable.GetCOG(buf)
-            vals = list(out) if out is not None else list(buf)
-            if len(vals) >= 3:
-                return tuple(float(v) * 1e3 for v in vals[:3]), "plain list"
-            errors.append(f"GetCOG(plain list): 只拿到 {len(vals)} 个分量")
+            got = _harvest(out if out is not None else buf, "plain list")
+            if got is not None:
+                return got, "plain list"
         except (AttributeError, pythoncom.com_error, ValueError, TypeError) as exc:  # type: ignore[attr-defined]
             errors.append(f"GetCOG(plain list): {exc}")
+
+        # 姿势 D：VBA 跳板。绕开 pywin32 的出参 marshalling —— 让 CATIA 自己在
+        # 内部跑一小段 VBScript 把数组接住再当返回值递出来。这是 pycatia 对同类
+        # 出参方法的通行解法，代价是需要脚本执行权限（企业环境可能被锁）。
+        if app is not None:
+            vba = (
+                "Function GetCOGArray(m)\n"
+                "    Dim c(2)\n"
+                "    m.GetCOG c\n"
+                "    GetCOGArray = c\n"
+                "End Function"
+            )
+            # 语言枚举在不同版本/文档里对不上号，按序试，成的记进 strategy
+            for lang in (2, 0, 1):
+                try:
+                    out = app.SystemService.Evaluate(vba, lang, "GetCOGArray", [measurable])
+                    got = _harvest(list(out) if out is not None else [], f"VBA(lang={lang})")
+                    if got is not None:
+                        return got, f"SystemService.Evaluate(lang={lang})"
+                except (AttributeError, pythoncom.com_error, ValueError, TypeError) as exc:  # type: ignore[attr-defined]
+                    errors.append(f"GetCOG(VBA lang={lang}): {exc}")
 
         return None, None
 
