@@ -453,20 +453,45 @@ REdge:(Edge:(Face:(Brp:(Pad.1;2);None:();Cf11:());Face:(Brp:(Pad.1;1);...
 
 这串 BRep 名字写死了「第几个面、第几条边」。上游特征一改，编号漂移，引用失效 —— 这是所有 CAD 自动化最经典的脆点，也是选 Fillet 作为第三个特征的原因：**早点把它暴露出来**，因为后续所有需要选面/选边的特征（倒角、抽壳、拔模）都会踩同一个坑。
 
-### 11.2 规避策略：不写死拓扑名字
+### 11.2 第一次尝试：把整个特征丢给 CATIA —— 被实测否决
 
-本实现**不去构造逐条边的 BRep 名字**，而是把整个特征/实体交给 CATIA，让它自己展开成全部边：
+最省事的想法是不碰单条边，直接把整个 Pad / Body 交给 CATIA，让它自己展开成全部边。于是把 8 种组合全跑了一遍（`{last_shape, body}` × `{包 Reference, 不包}` × `{AddNewSolidEdgeFillet…, AddNewEdgeFillet…}`）。**全部失败**，但失败方式讲清了原因：
 
-| 候选拾取对象              | 说明                               |
-| ------------------------- | ---------------------------------- |
-| `body.Shapes.Item(count)` | 实体里最后一个特征（通常就是 Pad） |
-| `body`                    | 整个实体                           |
+| 组合        | 报错                               | 含义                                                  |
+| ----------- | ---------------------------------- | ----------------------------------------------------- |
+| `ref=False` | `Type mismatch`                    | 方法必须收 `Reference`，不收裸 COM 对象               |
+| `ref=True`  | `The method AddNew…Fillet… failed` | 引用类型没问题，但**整个特征/实体不是合法的倒角对象** |
 
-每个候选再叉乘「包不包 `CreateReferenceFromObject`」×「`AddNewSolidEdgeFilletWithConstantRadius` / `AddNewEdgeFilletWithConstantRadius`」两种工厂方法 —— 因为方法名与可接受的对象类型在不同 CATIA 版本/配置下并不统一，而失败只在调用瞬间以 COM 错误暴露。**与其猜，不如把组合跑一遍并把每次失败原文记下来**（`target_errors`），生效的那条记进 `strategy`。
+这就是把候选组合全跑一遍、并把每次失败原文记进 `target_errors` 的价值：**否定结论也是结论**。如果只试一种写法，得到的只有一句没有信息量的 "method failed"，根本判断不出该往哪个方向改。
 
-代价说清楚：只能**整体倒角**，不能挑单条边。挑边留到确有需求时再按证据推进。
+结论：CATIA 要的是真正的**边引用**，没有捷径。
 
-### 11.3 验证用的是精确解，不是估算
+### 11.3 第二次尝试：让 CATIA 自己把边找出来
+
+既然必须要边引用，那手写 BRep 名字行不行？不行 —— 那等于把「第几个面、第几条边」硬编码进代码，换个模型立刻失效，而且拼错了同样只会得到一句 "method failed"。
+
+真正的解法是**用 CATIA 自己的选择集搜索**：
+
+```python
+selection.Search("Topology.CGMEdge,all")
+refs = [selection.Item(i).Reference for i in range(1, count + 1)]
+```
+
+拿到的 `Reference` 与人在界面上点选那条边**完全等价**，由 CATIA 自己生成 —— 天然合法，且不含任何硬编码拓扑名字。然后：
+
+```python
+fillet = shape_factory.AddNewSolidEdgeFilletWithConstantRadius(refs[0], mode, r)
+for ref in refs[1:]:
+    fillet.AddObjectToFillet(ref)     # 其余边追加进同一个特征
+```
+
+特征树上就是干净的一个 `EdgeFillet`，而不是 12 个碎特征。
+
+额外好处：**边的条数本身就是证据**。长方体应当正好 12 条，所以结果里带 `objects_filleted`——数量不对，立刻就知道拾取出了问题，不用等体积对不上才发现。
+
+搜索串在不同版本/语言环境下写法略有差异，所以按序试了三种（`Topology.CGMEdge,all` / `,sel` / 带引号形式），生效的记进 `strategy`。
+
+### 11.4 验证用的是精确解，不是估算
 
 倒圆角的去料量不好直接算（角料形状怪异）。所以反过来算**倒圆后的实体**，把它拆成四块互不重叠、每块都是初等体积的部分：
 
@@ -488,7 +513,7 @@ $$V_{\text{rounded}} = \underbrace{abc}_{\text{内芯}} + \underbrace{2r(ab+ac+b
 
 体积能对上，说明**12 条边全被拾到且都倒成功了** —— 这是引用层面真正生效的硬证据，比「没报错」强得多。
 
-### 11.4 冒烟测试（Windows，CATIA 已启动）
+### 11.5 冒烟测试（Windows，CATIA 已启动）
 
 ```powershell
 python scripts\add_fillet_smoke.py
@@ -499,21 +524,29 @@ python scripts\add_fillet_smoke.py
 ```
 ② 倒圆角证据：
     fillet_name           : EdgeFillet.1
-    strategy              : last_shape(Pad.1)/ref=True/AddNewSolidEdgeFilletWithConstantRadius
+    strategy              : Search(Topology.CGMEdge,all)/AddNewSolidEdgeFilletWithConstantRadius/edges=12
     update_ok             : True
     volume_before_mm3     : 24000.0
     volume_after_mm3      : 22235.99
     measured_removed_mm3  : 1764.01
     expected_removed_mm3  : 1764.012
     volume_match          : True
+    objects_filleted      : 12
     target_errors         : None
 
 判定： ✅ 倒圆角合格（边拾取生效，去料体积与精确解吻合）
 ```
 
-**读结果的顺序**：先看 `volume_match`（对不对），再看 `strategy`（怎么做到的），失败时看 `target_errors`（哪几条路走不通、原文报错是什么）。
+**读结果的顺序**：
 
-### 11.5 让 AI 倒角
+1. `objects_filleted` —— 拾到几条边？长方体必须是 12。这一步失败说明**拾取**有问题。
+2. `volume_match` —— 倒出来对不对？这一步失败说明**几何**有问题。
+3. `strategy` —— 具体是哪条路走通的。
+4. `target_errors` —— 失败时看哪几条路走不通、原文报错是什么。
+
+把「拾取」和「几何」分成两个独立可观测的指标，出问题时不用猜是哪一层。
+
+### 11.6 让 AI 倒角
 
 对 AI 说：**“把这个 40×30×20 的块所有边倒 R5 圆角。”**
 它应调用 `add_fillet(radius_mm=5, box_length_mm=40, box_width_mm=30, box_height_mm=20)`，并根据 `update_ok` / `volume_match` 回报是否合格。

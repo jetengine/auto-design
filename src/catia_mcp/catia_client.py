@@ -102,6 +102,7 @@ class FilletResult:
     expected_removed_mm3: Optional[float]  # 理论去料（只有传了长方体尺寸才算得出）
     volume_match: Optional[bool]           # 实测与理论是否吻合
     relative_error: Optional[float]
+    objects_filleted: Optional[int] = None # 实际倒了多少条边（长方体应为 12，本身就是证据）
     target_errors: Optional[list] = None   # 各失败拾取策略的原始 COM 报错
 
 
@@ -506,8 +507,8 @@ class CatiaClient:
         vol_before = self._measure_volume_mm3(part_doc, part, body)
 
         part.InWorkObject = body
-        fillet, strategy, target_errors = self._add_fillet_on_first_target(
-            part, body, float(radius_mm), propagation
+        fillet, strategy, edge_count, target_errors = self._add_fillet_on_edges(
+            part_doc, part, float(radius_mm), propagation
         )
 
         update_ok = True
@@ -550,74 +551,104 @@ class CatiaClient:
             expected_removed_mm3=expected_removed,
             volume_match=match,
             relative_error=rel_err,
+            objects_filleted=edge_count,
             target_errors=target_errors or None,
         )
 
-    def _add_fillet_on_first_target(
-        self, part, body, radius_mm: float, propagation: str
-    ):
-        """依次尝试「拾取对象 × 工厂方法」的组合，第一个不报错的胜出。
+    def _add_fillet_on_edges(self, part_doc, part, radius_mm: float, propagation: str):
+        """拾取实体的全部边并倒角。返回 (fillet, strategy, edge_count, errors)。
 
-        为什么要穷举：`ShapeFactory` 里倒圆角的方法名和可接受的拾取对象类型
-        在不同 CATIA 版本/配置下并不统一（`AddNewSolidEdgeFillet...` 与
-        `AddNewEdgeFillet...` 都存在），而失败只在调用瞬间以 COM 错误暴露。
-        与其猜，不如把候选组合跑一遍并**把每次失败原文记下来**。
+        ── 为什么不是「把整个特征丢给 CATIA」──
+        那条路已被实测否决（8 种组合全失败），而且失败方式讲清了原因：
+            ref=False → "Type mismatch"  ：方法必须收 Reference，不收裸 COM 对象
+            ref=True  → "method failed"  ：引用类型没问题，但**整个特征/实体不是合法的倒角对象**
+        CATIA 要的是真正的**边引用**，没有捷径。
 
-        返回 (fillet, strategy, errors)
+        ── 为什么不手写 BRep 名字 ──
+        边引用长这样：`REdge:(Edge:(Face:(Brp:(Pad.1;2);None:();Cf11:());...`
+        手写就等于把「第几个面、第几条边」硬编码进代码，换个模型立刻失效，
+        而且拼错了只会得到一句没有信息量的 "method failed"。
+
+        ── 实际做法：让 CATIA 自己把边找出来 ──
+        用文档的 `Selection.Search("Topology.CGMEdge,all")`，拿到的 Reference
+        与人在界面上点选那条边**完全等价**，由 CATIA 自己生成，因此天然合法、
+        不含任何硬编码拓扑名字。然后在第一条边上建圆角，其余边用
+        `AddObjectToFillet` 追加进同一个特征 —— 特征树上就是干净的一个 EdgeFillet。
+
+        额外好处：边的条数本身就是证据。长方体应当正好是 12 条。
         """
         # catTangencyFilletEdgePropagation = 1 / catMinimalFilletEdgePropagation = 2
         mode = 1 if propagation == "tangency" else 2
         shape_factory = part.ShapeFactory
         errors: list = []
 
-        targets: list[tuple[str, object]] = []
-        # 候选 1：实体里最后一个特征（通常就是 Pad/Pocket）——倒它的全部边
-        try:
-            shapes = body.Shapes
-            count = int(shapes.Count)
-            if count > 0:
-                last = shapes.Item(count)
-                targets.append((f"last_shape({last.Name})", last))
-        except pythoncom.com_error as exc:  # type: ignore[attr-defined]
-            errors.append(f"取 last_shape 失败: {exc}")
-        # 候选 2：整个 Body——倒实体的全部边
-        targets.append(("body", body))
+        refs, query = self._search_edge_references(part_doc, errors)
+        if not refs:
+            raise RuntimeError(
+                "没能拾取到任何边，倒圆角无法进行。\n"
+                "各次尝试的原始报错：\n  " + "\n  ".join(str(e) for e in errors)
+            )
 
         methods = (
             "AddNewSolidEdgeFilletWithConstantRadius",
             "AddNewEdgeFilletWithConstantRadius",
         )
+        for method_name in methods:
+            method = getattr(shape_factory, method_name, None)
+            if method is None:
+                continue
+            try:
+                fillet = method(refs[0], mode, radius_mm)
+            except pythoncom.com_error as exc:  # type: ignore[attr-defined]
+                errors.append(f"{method_name}(第 1 条边): {exc}")
+                continue
 
-        for target_name, target_obj in targets:
-            for as_ref in (True, False):
+            added = 1
+            for ref in refs[1:]:
                 try:
-                    picked = (
-                        part.CreateReferenceFromObject(target_obj)
-                        if as_ref
-                        else target_obj
-                    )
+                    fillet.AddObjectToFillet(ref)
+                    added += 1
                 except pythoncom.com_error as exc:  # type: ignore[attr-defined]
-                    errors.append(f"{target_name}/ref={as_ref}: 造引用失败 {exc}")
-                    continue
-                for method_name in methods:
-                    method = getattr(shape_factory, method_name, None)
-                    if method is None:
-                        continue
-                    try:
-                        fillet = method(picked, mode, radius_mm)
-                        return (
-                            fillet,
-                            f"{target_name}/ref={as_ref}/{method_name}",
-                            errors,
-                        )
-                    except pythoncom.com_error as exc:  # type: ignore[attr-defined]
-                        errors.append(f"{target_name}/ref={as_ref}/{method_name}: {exc}")
+                    # 单条边加不进去不致命：记下来，让体积证据去说明少倒了多少
+                    errors.append(f"AddObjectToFillet(第 {added + 1} 条边): {exc}")
+            return fillet, f"{query}/{method_name}/edges={added}", added, errors
 
         raise RuntimeError(
-            "所有倒圆角拾取策略都失败了。这通常意味着这台 CATIA 不接受"
-            "「整体特征/实体」作为倒角对象，需要改为逐条边的 BRep 引用。\n"
+            f"拾到了 {len(refs)} 条边，但 ShapeFactory 的倒圆角方法都调用失败。\n"
             "各次尝试的原始报错：\n  " + "\n  ".join(str(e) for e in errors)
         )
+
+    @staticmethod
+    def _search_edge_references(part_doc, errors: list):
+        """用 CATIA 的选择集搜索语法把实体上的边全部捞出来，返回 (refs, 生效的查询串)。
+
+        查询串在不同版本/语言环境下写法略有差异，所以按序试几种，谁成谁上。
+        """
+        queries = (
+            "Topology.CGMEdge,all",
+            "Topology.CGMEdge,sel",
+            "'Topology'.CGMEdge,all",
+        )
+        selection = part_doc.Selection
+        for query in queries:
+            try:
+                selection.Clear()
+                selection.Search(query)
+                count = int(getattr(selection, "Count2", 0) or selection.Count)
+                if count <= 0:
+                    errors.append(f"Search({query!r}): 命中 0 条")
+                    continue
+                refs = [selection.Item(i).Reference for i in range(1, count + 1)]
+                selection.Clear()
+                return refs, f"Search({query})"
+            except pythoncom.com_error as exc:  # type: ignore[attr-defined]
+                errors.append(f"Search({query!r}): {exc}")
+            finally:
+                try:
+                    selection.Clear()
+                except pythoncom.com_error:  # type: ignore[attr-defined]
+                    pass
+        return [], ""
 
     @staticmethod
     def _box_fillet_removed_mm3(
