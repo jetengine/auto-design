@@ -60,29 +60,50 @@ async def main() -> int:
                 if text:
                     print(f"    {text}")
 
-    async with stdio_client(params) as (read, write):
-        async with ClientSession(read, write) as session:
-            await session.initialize()
-            print("✅ MCP 协议握手成功（initialize 完成）")
+    # server 子进程若在握手前崩溃，客户端只会看到 "Connection closed"。
+    # 把 server 的 stderr 落到日志文件，保证崩溃原因一定留痕、可复现。
+    stderr_log_path = os.path.join(out_dir, "mcp_server_stderr.log")
+    stderr_log = open(stderr_log_path, "w", encoding="utf-8")
+    try:
+        async with stdio_client(params, errlog=stderr_log) as (read, write):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                print("✅ MCP 协议握手成功（initialize 完成）")
 
-            tools = await session.list_tools()
-            names = [t.name for t in tools.tools]
-            print(f"✅ 发现工具：{names}")
+                tools = await session.list_tools()
+                names = [t.name for t in tools.tools]
+                print(f"✅ 发现工具：{names}")
 
-            r1 = await session.call_tool("get_catia_session", {})
-            _dump("get_catia_session（只读健康检查）", r1)
+                r1 = await session.call_tool("get_catia_session", {})
+                _dump("get_catia_session（只读健康检查）", r1)
 
-            r2 = await session.call_tool(
-                "create_box",
-                {"length_mm": 100.0, "width_mm": 60.0, "height_mm": 20.0, "part_name": f"AiBox_{tag}"},
-            )
-            _dump("create_box（建模 + 体积回读）", r2)
+                r2 = await session.call_tool(
+                    "create_box",
+                    {"length_mm": 100.0, "width_mm": 60.0, "height_mm": 20.0, "part_name": f"AiBox_{tag}"},
+                )
+                _dump("create_box（建模 + 体积回读）", r2)
 
-            r3 = await session.call_tool(
-                "export_step_and_verify",
-                {"step_path": step_path, "catpart_path": catpart_path},
-            )
-            _dump("export_step_and_verify（保存 + 中性格式导出 + 回读）", r3)
+                r3 = await session.call_tool(
+                    "export_step_and_verify",
+                    {"step_path": step_path, "catpart_path": catpart_path},
+                )
+                _dump("export_step_and_verify（保存 + 中性格式导出 + 回读）", r3)
+    except Exception as exc:  # noqa: BLE001
+        stderr_log.flush()
+        print(f"\n❌ 端到端失败：{exc}", file=sys.stderr)
+        print(f"   server 崩溃日志已写入：{stderr_log_path}", file=sys.stderr)
+        try:
+            with open(stderr_log_path, "r", encoding="utf-8") as fh:
+                tail = fh.read().strip()
+            if tail:
+                print("---- server stderr ----", file=sys.stderr)
+                print(tail, file=sys.stderr)
+                print("-----------------------", file=sys.stderr)
+        except OSError:
+            pass
+        return 1
+    finally:
+        stderr_log.close()
 
     print("\n判定： ✅ 端到端链路跑通（MCP client → server → ComWorker → CATIA）")
     return 0
