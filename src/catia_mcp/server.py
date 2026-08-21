@@ -47,6 +47,75 @@ _worker = ComWorker()
 
 
 @mcp.tool()
+def catia_health() -> dict:
+    """检查 AI↔CATIA 链路是否健康。任何建模失败/超时之后，**先调这个**。
+
+    它分两层，且第一层不碰 CATIA —— 所以链路卡死时它仍然能回答：
+        link.*        本地链路状态（线程、队列、当前卡在哪个任务、卡了多久）
+        ping_ok / ping_error / catia_caption：一次廉价的真实 COM 往返
+
+    关键字段：
+        link.blocked:           true = 链路被一个卡死的任务堵住，后续调用会直接快速失败
+        link.blocked_by:        堵住链路的任务名
+        link.current_job_age_s: 当前任务已运行秒数
+        ping_ok:                true = CATIA 真实可达
+
+    处置建议：
+        blocked=true 或 ping_ok=false 时，先提醒用户**去 CATIA 窗口关掉模态对话框**
+        （最常见原因），关掉后仍不恢复再调 reconnect_catia。
+    """
+    link = _worker.health()
+    result: dict = {"link": link}
+
+    if link["blocked"]:
+        # 链路已堵，再去 ping 只会白白多等一个超时
+        result.update(
+            ping_ok=False,
+            ping_error=f"链路被「{link['blocked_by']}」堵住，已跳过 ping。",
+            catia_caption=None,
+        )
+        return result
+
+    try:
+        caption = _worker.call(
+            lambda c: c.ping(), timeout=10.0, label="catia_health.ping"
+        )
+        result.update(ping_ok=True, ping_error=None, catia_caption=caption)
+    except Exception as exc:  # noqa: BLE001 —— 健康检查本身绝不能把异常抛给 AI
+        result.update(ping_ok=False, ping_error=str(exc), catia_caption=None)
+    return result
+
+
+@mcp.tool()
+def reconnect_catia() -> dict:
+    """重建到 CATIA 的连接（不重启本进程）。仅在 catia_health 显示链路异常时使用。
+
+    作用：丢弃卡死的 COM 线程，另起一个干净线程重新连 CATIA，使链路恢复可用。
+
+    前提：若 CATIA 前台还开着模态对话框，**先关掉它再调本工具**，
+    否则新连接一干活还会被同一个框挡住。
+
+    返回：
+        before:    重建前的链路快照（含堵死链路的任务名，用于事后定位）
+        after:     重建后的链路快照
+        recovered: 重建后一次真实 ping 是否成功
+    """
+    before = _worker.restart()
+    try:
+        caption = _worker.call(lambda c: c.ping(), timeout=15.0, label="reconnect.ping")
+        recovered, ping_error = True, None
+    except Exception as exc:  # noqa: BLE001
+        caption, recovered, ping_error = None, False, str(exc)
+    return {
+        "before": before,
+        "after": _worker.health(),
+        "recovered": recovered,
+        "ping_error": ping_error,
+        "catia_caption": caption,
+    }
+
+
+@mcp.tool()
 def get_catia_session() -> dict:
     """获取当前 CATIA 会话的只读状态快照。
 
@@ -64,7 +133,7 @@ def get_catia_session() -> dict:
     def _job(client: CatiaClient) -> CatiaSessionInfo:
         return client.session_info()
 
-    info = _worker.call(_job, timeout=30.0)
+    info = _worker.call(_job, timeout=30.0, label="get_catia_session")
     return asdict(info)
 
 
@@ -105,7 +174,7 @@ def create_box(
         )
 
     # 建模比只读探测慢，给更长超时（超时熔断 = 安全边界）
-    result = _worker.call(_job, timeout=120.0)
+    result = _worker.call(_job, timeout=120.0, label="create_box")
     return asdict(result)
 
 
@@ -153,7 +222,7 @@ def add_pocket(
             center_y_mm=center_y_mm,
         )
 
-    result = _worker.call(_job, timeout=120.0)
+    result = _worker.call(_job, timeout=120.0, label="add_pocket")
     return asdict(result)
 
 
@@ -194,7 +263,7 @@ def export_step_and_verify(
         )
 
     # 保存 + 导出 + 重新打开测量，耗时较长
-    result = _worker.call(_job, timeout=180.0)
+    result = _worker.call(_job, timeout=180.0, label="export_step_and_verify")
     return asdict(result)
 
 

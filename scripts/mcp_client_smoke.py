@@ -74,6 +74,9 @@ async def main() -> int:
                 names = [t.name for t in tools.tools]
                 print(f"✅ 发现工具：{names}")
 
+                r0 = await session.call_tool("catia_health", {})
+                _dump("catia_health（链路健康检查，动手前先问）", r0)
+
                 r1 = await session.call_tool("get_catia_session", {})
                 _dump("get_catia_session（只读健康检查）", r1)
 

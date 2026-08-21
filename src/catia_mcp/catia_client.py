@@ -126,6 +126,21 @@ class CatiaClient:
                 f"原始错误：{exc}"
             ) from exc
 
+        # 掐掉一类真实的死锁源：文件相关的模态对话框（覆盖确认、只读提示……）。
+        # 它们一旦弹出，当前 COM 调用永远不返回，整条单 STA 链路就此卡死。
+        # 关掉后 CATIA 会用默认行为继续，不再等人点按钮。
+        try:
+            self._app.DisplayFileAlerts = False
+        except (AttributeError, pythoncom.com_error):  # type: ignore[attr-defined]
+            pass  # 老版本没有该属性，不影响主流程
+
+    def ping(self) -> str:
+        """最廉价的一次真实 COM 往返，用来确认链路不只是「没卡」，而是真能通。
+
+        故意只读 Caption：不碰文档、不触发任何计算，代价接近于零。
+        """
+        return str(self._require_app().Caption)
+
     # ------------------------------------------------------------------
     # 只读探测
     # ------------------------------------------------------------------

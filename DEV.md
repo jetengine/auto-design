@@ -247,7 +247,7 @@ python scripts\export_step_smoke.py
 
 1. 加 `measure_*` 只读测量族，扩充证据类工具。
 2. 引入超时熔断 + 会话心跳看门狗（1、3 号风险）。
-3. 扩到 Pocket / Fillet 等更多 Part Design 特征。
+3. 扩到更多 Part Design 特征（Pocket 已完成，见第 9 节；下一步 Fillet / Hole）。
 4. STEP 回读支持 Product 结构（多体/装配）。
 
 ## 8. 端到端：AI 端 → CATIA 全链路
@@ -290,19 +290,39 @@ AI 应依次调用 `get_catia_session` → `create_box` → `export_step_and_ver
 
 ## 9. 第二种特征：挖槽 —— `add_pocket`（去料 + 体积差验证）
 
-`create_box` 是加料，`add_pocket` 是**去料**——证明框架能做双向材料操作并验证。机制与建长方体同源、同样稳健（只用**偏移平面 + 草图 + Pocket**，不做脆弱的面/边拾取）：
+`create_box` 是加料，`add_pocket` 是**去料**——证明框架能做双向材料操作并验证。机制与建长方体同源（只用**平面 + 草图 + Pocket**，不做脆弱的面/边拾取）：
 
 ```
 XY 面上方 at_height 处建偏移平面 → 画矩形 → Pocket 向下挖 depth → Update → 体积差比对
 ```
 
-### 9.1 无 AI 冒烟测试（Windows，CATIA 已启动）
+### 9.1 踩到的坑：偏移平面挂不上草图
+
+先后两次都挂在同一行：
+
+```
+sketch = body.Sketches.Add(offset_plane)
+pywintypes.com_error: (-2147352567, ..., (0, 'CATIASketches', 'The method Add failed', ...))
+```
+
+真因不是参数包没包 `CreateReferenceFromObject`（两种写法报同一个错），而是那个平面**根本没有几何**：`AddNewPlaneOffset` 造出的平面必须先被挂进某个容器并 `Update()` 才被真正算出来；而原先用的 `body.InsertHybridShape(plane)` **只在 Part 开了 Hybrid Design 时才成立**，这台机器上不成立。
+
+修正：改用**几何图形集**（`part.HybridBodies.Add()`）——每个 Part 都有这个容器，不依赖任何开关。`_make_pocket_sketch()` 把它做成降级链：
+
+| 策略          | 做法                                                                                           | 挖料方向 |
+| ------------- | ---------------------------------------------------------------------------------------------- | -------- |
+| **A**         | `HybridBodies.Add()` → `AppendHybridShape` → `InWorkObject=hb` → `Update` → 在偏移平面上建草图 | 顶面向下 |
+| **B**（兜底） | 直接用 `PlaneXY`（`create_box` 已证可用），把 Pocket 方向翻成 +Z                               | 底面向上 |
+
+结果里带 `strategy` / `pocket_from` / `plane_errors` 三个**自证字段**，不用猜走了哪条路。
+
+### 9.2 无 AI 冒烟测试（Windows，CATIA 已启动）
 
 ```powershell
 python scripts\add_pocket_smoke.py
 ```
 
-它建长方体 100×60×20，再在顶面居中挖 40×30、深 10 的盲槽。关键字段：
+它建长方体 100×60×20，再在顶面居中挖 40×30、深 10 的盲槽。**实际输出（已跑通）**：
 
 ```
 ② 挖槽证据：
@@ -313,21 +333,90 @@ python scripts\add_pocket_smoke.py
     expected_removed_mm3  : 12000.0
     measured_removed_mm3  : 12000.0
     volume_match          : True
-    relative_error        : ~0.0
+    relative_error        : 0.0
+    strategy              : hybrid_body_offset_plane(ref=False)
+    pocket_from           : top
+    plane_errors          : None
 
 判定： ✅ 去料合格（建模 + 挖槽体积差均通过）
 ```
 
-- `volume_match=True` → 实测去料（before−after）与理论 `pl×pw×depth` 吻合（容差 0.1%）。
+- `volume_match=True` → 实测去料（before−after）与理论 `pl×pw×depth` 完全吻合（容差 0.1%）。
+- `strategy=hybrid_body_offset_plane(ref=False)` → 策略 A 生效，平面对象直接传即可，无需包 Reference。
 - 约束：`depth < at_height`（只做盲槽，避免挖穿）；槽中心用长方体的 `L/2、W/2` 对齐。
 
-### 9.2 让 AI 挖槽
+### 9.3 让 AI 挖槽
 
 对 AI 说：**“在刚才的长方体顶面正中挖一个 40×30、深 10 的槽。”**
 它应调用 `add_pocket(pocket_length_mm=40, pocket_width_mm=30, depth_mm=10, at_height_mm=20, center_x_mm=50, center_y_mm=30)`，并根据 `update_ok` / `volume_match` 回报是否合格。
 
-### 9.3 再下一步
+### 9.4 再下一步
 
 1. Fillet（倒圆角）：需要边/面引用，比平面+草图更脆弱，单独一轮按证据推进。
 2. Hole（孔）：草图点 + Hole 特征。
 3. IGES 回读体积：导入曲面 `CloseSurface` 封成固体再测。
+
+## 10. 健壮性：超时熔断 + 阻塞自诊断 + 重建恢复
+
+### 10.1 要防的是什么
+
+单 STA 线程保证了 COM 调用串行有序，但代价是 **一个调用卡死 = 整条链路卡死**。这不是理论风险：CATIA 只要在前台弹一个模态框（许可证提示、文件覆盖确认、错误对话框），当前 COM 调用就**永远不返回**，没有任何超时。
+
+改造前的后果很难受：
+
+- 卡住的那次调用超时失败；
+- STA 线程仍死在里面，**后续每次调用都排队 → 各自等满超时 → 全部失败**；
+- 而且报的都是「超时」这种没有信息量的错，AI 和人都不知道到底出了什么事。
+
+### 10.2 四道防线
+
+| 防线           | 位置                                                   | 作用                                                             |
+| -------------- | ------------------------------------------------------ | ---------------------------------------------------------------- |
+| **掐掉弹框源** | `CatiaClient.connect()` 设 `DisplayFileAlerts = False` | 让文件类模态框根本不弹，从源头减少死锁                           |
+| **超时熔断**   | `ComWorker.call(..., timeout, label)`                  | 到点即失败，并把链路标记为「被 label 堵住」                      |
+| **快速失败**   | 下一次 `call()` 的前置检查                             | 链路已知被堵时**立即** `CatiaBlockedError`，不再陪等一个完整超时 |
+| **重建恢复**   | `ComWorker.restart()`                                  | 丢弃卡死线程，另起干净线程重连，无需重启进程                     |
+
+两个设计要点值得记：
+
+1. **`health()` 不碰 COM。** 健康检查如果自己也要走 COM，链路一卡它就跟着卡 —— 那就永远问不出「到底出了什么事」。所以它只读本地状态（线程存活、队列深度、当前任务名与已运行秒数），**卡死时也一定能返回**。真实 COM 往返（`ping`）是单独一层，且链路已堵时直接跳过。
+2. **卡死线程是「丢弃」不是「杀死」。** 卡在 COM 调用里的线程无法被安全终止（强杀会破坏 COM 运行时状态）。它是 daemon 线程，会挂到 CATIA 那边的框被关掉后自行结束。我们只是不再等它，代价是短暂多一个僵尸线程 —— 这是清醒的取舍，不是遗漏。
+
+### 10.3 两个新工具
+
+- **`catia_health`** —— 任何失败后 AI 应该先调的。返回 `link.blocked` / `link.blocked_by` / `link.current_job_age_s` / `ping_ok`。
+- **`reconnect_catia`** —— 仅在 health 显示异常时用。返回 `before`（含堵死链路的任务名，留证）/ `after` / `recovered`。
+
+错误信息本身就是处置指引，AI 能直接转述给用户：
+
+```
+「create_box」超过 120s 未返回，当前卡在「create_box」已 133s。
+CATIA 通常是被模态对话框挡住了（许可证/覆盖确认/错误框）。
+处理：切到 CATIA 窗口关闭对话框；必要时调用 reconnect_catia 重建链路。
+```
+
+### 10.4 冒烟测试（会**人为制造一次卡死**）
+
+```powershell
+python scripts\health_smoke.py
+```
+
+它占住 STA 线程 25 秒来模拟 COM 卡死 —— 与真实卡死在「线程被占住、后续任务全堵在队列」这点上完全等价，但可控、可重复。逐项验证：
+
+```
+① 正常态健康检查        → 链路空闲、CATIA 可达
+② 人为制造卡死          → 受害调用超时，且错误里指名了阻塞源 fake_hang
+③ 卡死态下的健康检查    → health 立即返回（<1s），如实报 blocked 与已卡秒数
+④ 熔断                  → 预算 60s 的调用在 <1s 内失败，没有白等
+⑤ 恢复                  → restart 后 ping 成功，blocked 清除
+
+判定： ✅ 健壮性合格（超时熔断 / 阻塞自诊断 / 重建恢复 全部生效）
+```
+
+第 ③④ 两条是重点：**健康检查自己不卡** + **熔断不空等**，这两点决定了链路出事时系统还能不能说人话。
+
+### 10.5 尚未覆盖
+
+1. 卡死线程回收：僵尸线程要等 CATIA 那边解除阻塞才结束，多次 restart 会累积。
+2. 无人值守：现在靠 AI/人看到 health 再决定重连，没有后台看门狗自动触发。
+3. CATIA 进程崩溃/退出：目前表现为连接错误，尚未做自动重连退避。
