@@ -57,6 +57,27 @@ class BoxResult:
 
 
 @dataclass
+class PocketResult:
+    """在活动 Part 上挖一个矩形槽（去料特征）的结构化证据。"""
+
+    document_name: str                     # 活动 Part 文档名
+    body_name: str                         # PartBody 名
+    sketch_name: str                       # 槽轮廓草图名
+    pocket_name: str                       # Pocket 特征名
+    pocket_length_mm: float
+    pocket_width_mm: float
+    depth_mm: float
+    update_ok: bool                        # 特征树 Update 是否成功（无红叉）
+    volume_before_mm3: Optional[float]     # 挖槽前体积
+    volume_after_mm3: Optional[float]      # 挖槽后体积
+    expected_removed_mm3: float            # 理论去料体积 = pl×pw×depth
+    measured_removed_mm3: Optional[float]  # 实测去料体积 = before − after
+    volume_match: Optional[bool]           # 实测去料是否与理论吻合（容差内）
+    relative_error: Optional[float]        # 相对误差
+
+
+
+@dataclass
 class ExportResult:
     """安全保存 + STEP 导出回读的结构化证据（对应验证原则 5）。"""
 
@@ -221,6 +242,115 @@ class CatiaClient:
             update_ok=update_ok,
             expected_volume_mm3=expected,
             measured_volume_mm3=measured,
+            volume_match=match,
+            relative_error=rel_err,
+        )
+
+    # ------------------------------------------------------------------
+    # 写操作（去料特征）
+    # ------------------------------------------------------------------
+    def add_pocket(
+        self,
+        pocket_length_mm: float,
+        pocket_width_mm: float,
+        depth_mm: float,
+        at_height_mm: float,
+        center_x_mm: Optional[float] = None,
+        center_y_mm: Optional[float] = None,
+        volume_tolerance: float = 1e-3,
+    ) -> PocketResult:
+        """在当前活动 Part 的顶面挖一个矩形槽（Pocket 去料特征），并用体积差验证。
+
+        机制与 create_box 同源、同样稳健（只用平面 + 草图，不做脆弱的面/边拾取）：
+            在 XY 面上方 at_height 处建一个偏移平面（与长方体顶面共面）
+            → 在其上画矩形 → Pocket 向下（-Z）挖 depth → Update → 体积差比对
+
+        参数：
+            pocket_length_mm/pocket_width_mm: 槽的长宽（毫米）
+            depth_mm:      挖深（毫米，应 < 长方体高度，避免挖穿）
+            at_height_mm:  顶面所在的 Z 高度（= 目标长方体的高度）
+            center_x_mm/center_y_mm: 槽中心（默认取长方体中心，需与 create_box 的 L/2、W/2 对齐）
+            volume_tolerance: 去料体积相对误差容差，默认 0.1%
+
+        产出保留可编辑特征树：偏移平面 + Sketch + Pocket。
+        """
+        if min(pocket_length_mm, pocket_width_mm, depth_mm) <= 0:
+            raise ValueError("槽的长宽深必须为正数。")
+        if depth_mm >= at_height_mm:
+            raise ValueError(
+                f"挖深 {depth_mm} 应小于顶面高度 {at_height_mm}，否则会挖穿（本阶段只做盲槽）。"
+            )
+
+        app = self._require_app()
+
+        part_doc = app.ActiveDocument
+        part = part_doc.Part
+        body = part.Bodies.Item(1)
+
+        # 0) 挖槽前体积证据
+        vol_before = self._measure_volume_mm3(part_doc, part, body)
+
+        # 1) 在 XY 面上方 at_height 处建偏移平面（法向 +Z，与顶面共面）
+        hsf = part.HybridShapeFactory
+        ref_xy = part.CreateReferenceFromObject(part.OriginElements.PlaneXY)
+        offset_plane = hsf.AddNewPlaneOffset(ref_xy, float(at_height_mm), False)
+        body.InsertHybridShape(offset_plane)
+        part.InWorkObject = body
+        part.Update()
+
+        # 2) 在偏移平面上画居中矩形（平面 H/V 轴与全局 X/Y 对齐）
+        pl = float(pocket_length_mm)
+        pw = float(pocket_width_mm)
+        cx = float(center_x_mm) if center_x_mm is not None else pl  # 默认与长方体中心对齐由调用方保证
+        cy = float(center_y_mm) if center_y_mm is not None else pw
+        x0, x1 = cx - pl / 2.0, cx + pl / 2.0
+        y0, y1 = cy - pw / 2.0, cy + pw / 2.0
+
+        sketch = body.Sketches.Add(part.CreateReferenceFromObject(offset_plane))
+        factory_2d = sketch.OpenEdition()
+        factory_2d.CreateLine(x0, y0, x1, y0)
+        factory_2d.CreateLine(x1, y0, x1, y1)
+        factory_2d.CreateLine(x1, y1, x0, y1)
+        factory_2d.CreateLine(x0, y1, x0, y0)
+        sketch.CloseEdition()
+
+        # 3) Pocket 去料：偏移平面法向为 +Z，Pocket 默认沿 -Z 向下挖 depth
+        part.InWorkObject = body
+        shape_factory = part.ShapeFactory
+        pocket = shape_factory.AddNewPocket(sketch, float(depth_mm))
+
+        # 4) 更新检查
+        update_ok = True
+        try:
+            part.Update()
+        except pythoncom.com_error:  # type: ignore[attr-defined]
+            update_ok = False
+
+        # 5) 挖槽后体积 + 去料量比对
+        vol_after = self._measure_volume_mm3(part_doc, part, body)
+        expected_removed = pl * pw * float(depth_mm)
+        measured_removed: Optional[float] = None
+        match: Optional[bool] = None
+        rel_err: Optional[float] = None
+        if vol_before is not None and vol_after is not None:
+            measured_removed = vol_before - vol_after
+            if expected_removed > 0:
+                rel_err = abs(measured_removed - expected_removed) / expected_removed
+                match = rel_err <= volume_tolerance
+
+        return PocketResult(
+            document_name=str(part_doc.Name),
+            body_name=str(body.Name),
+            sketch_name=str(sketch.Name),
+            pocket_name=str(pocket.Name),
+            pocket_length_mm=pl,
+            pocket_width_mm=pw,
+            depth_mm=float(depth_mm),
+            update_ok=update_ok,
+            volume_before_mm3=vol_before,
+            volume_after_mm3=vol_after,
+            expected_removed_mm3=expected_removed,
+            measured_removed_mm3=measured_removed,
             volume_match=match,
             relative_error=rel_err,
         )

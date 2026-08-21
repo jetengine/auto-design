@@ -287,3 +287,47 @@ python scripts\mcp_client_smoke.py
 4. 对 AI 说：**“看看 CATIA 现在什么状态，然后建个 100×60×20 的长方体并导出验证。”**
 
 AI 应依次调用 `get_catia_session` → `create_box` → `export_step_and_verify`，并根据返回证据回报是否交付合格。这就是完整价值主张的端到端演示。
+
+## 9. 第二种特征：挖槽 —— `add_pocket`（去料 + 体积差验证）
+
+`create_box` 是加料，`add_pocket` 是**去料**——证明框架能做双向材料操作并验证。机制与建长方体同源、同样稳健（只用**偏移平面 + 草图 + Pocket**，不做脆弱的面/边拾取）：
+
+```
+XY 面上方 at_height 处建偏移平面 → 画矩形 → Pocket 向下挖 depth → Update → 体积差比对
+```
+
+### 9.1 无 AI 冒烟测试（Windows，CATIA 已启动）
+
+```powershell
+python scripts\add_pocket_smoke.py
+```
+
+它建长方体 100×60×20，再在顶面居中挖 40×30、深 10 的盲槽。关键字段：
+
+```
+② 挖槽证据：
+    pocket_name           : Pocket.1
+    update_ok             : True
+    volume_before_mm3     : 120000.0
+    volume_after_mm3      : 108000.0
+    expected_removed_mm3  : 12000.0
+    measured_removed_mm3  : 12000.0
+    volume_match          : True
+    relative_error        : ~0.0
+
+判定： ✅ 去料合格（建模 + 挖槽体积差均通过）
+```
+
+- `volume_match=True` → 实测去料（before−after）与理论 `pl×pw×depth` 吻合（容差 0.1%）。
+- 约束：`depth < at_height`（只做盲槽，避免挖穿）；槽中心用长方体的 `L/2、W/2` 对齐。
+
+### 9.2 让 AI 挖槽
+
+对 AI 说：**“在刚才的长方体顶面正中挖一个 40×30、深 10 的槽。”**
+它应调用 `add_pocket(pocket_length_mm=40, pocket_width_mm=30, depth_mm=10, at_height_mm=20, center_x_mm=50, center_y_mm=30)`，并根据 `update_ok` / `volume_match` 回报是否合格。
+
+### 9.3 再下一步
+
+1. Fillet（倒圆角）：需要边/面引用，比平面+草图更脆弱，单独一轮按证据推进。
+2. Hole（孔）：草图点 + Hole 特征。
+3. IGES 回读体积：导入曲面 `CloseSurface` 封成固体再测。

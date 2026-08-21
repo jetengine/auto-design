@@ -21,11 +21,25 @@ from dataclasses import asdict
 if sys.platform != "win32":
     raise RuntimeError("catia_mcp.server 只能在 Windows 上运行（需要 CATIA COM）。")
 
-from mcp.server.fastmcp import FastMCP  # type: ignore[import-not-found]
+# FastMCP 在不同发行里位置不同：官方 SDK 打包在 mcp.server.fastmcp，
+# 也存在独立的 fastmcp 包。两处都试，给出可操作的报错。
+try:
+    from mcp.server.fastmcp import FastMCP  # type: ignore[import-not-found]
+except ModuleNotFoundError:
+    try:
+        from fastmcp import FastMCP  # type: ignore[import-not-found]
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            "找不到 FastMCP。你的 mcp 包里没有 mcp.server.fastmcp，也没有独立的 fastmcp。\n"
+            "请安装带 FastMCP 的官方 SDK：\n"
+            "    python -m pip install -U \"mcp>=1.2.0\"\n"
+            "若仍失败，先查看已装版本：\n"
+            "    python -c \"import mcp,os;print(mcp.__version__);import mcp.server as s;print(os.listdir(os.path.dirname(s.__file__)))\""
+        ) from exc
+
 
 from .catia_client import CatiaClient, CatiaSessionInfo
 from .com_worker import ComWorker
-
 mcp = FastMCP("catia-mcp")
 
 # 单一 STA worker，进程内唯一
@@ -93,6 +107,55 @@ def create_box(
     # 建模比只读探测慢，给更长超时（超时熔断 = 安全边界）
     result = _worker.call(_job, timeout=120.0)
     return asdict(result)
+
+
+@mcp.tool()
+def add_pocket(
+    pocket_length_mm: float,
+    pocket_width_mm: float,
+    depth_mm: float,
+    at_height_mm: float,
+    center_x_mm: float | None = None,
+    center_y_mm: float | None = None,
+) -> dict:
+    """在当前活动 Part 的顶面挖一个矩形盲槽（Pocket 去料特征），并用体积差验证。
+
+    这是第二种特征类型（去料），机制与 create_box 同源、同样稳健：
+    偏移平面 + 草图矩形 + Pocket 向下挖，产出保留可编辑特征树。
+
+    参数：
+        pocket_length_mm/pocket_width_mm: 槽的长宽（毫米，>0）
+        depth_mm:      挖深（毫米，须 < at_height_mm，只做盲槽避免挖穿）
+        at_height_mm:  顶面所在 Z 高度（= 目标长方体高度）
+        center_x_mm/center_y_mm: 槽中心（默认与长方体中心对齐；配合 create_box 用 L/2、W/2）
+
+    返回（既是结果也是证据）：
+        pocket_name:            生成的 Pocket 特征名
+        update_ok:              特征树 Update 是否成功
+        volume_before_mm3:      挖槽前体积
+        volume_after_mm3:       挖槽后体积
+        expected_removed_mm3:   理论去料体积 = pl×pw×depth
+        measured_removed_mm3:   实测去料体积 = before − after
+        volume_match:           实测去料是否与理论吻合（容差 0.1% 内）
+        relative_error:         相对误差
+
+    使用建议：update_ok 与 volume_match 都为 true 才算去料合格。
+    先用 create_box 建体，再用同样的 length/width（中心 L/2、W/2）挖槽。
+    """
+
+    def _job(client: CatiaClient):
+        return client.add_pocket(
+            pocket_length_mm=pocket_length_mm,
+            pocket_width_mm=pocket_width_mm,
+            depth_mm=depth_mm,
+            at_height_mm=at_height_mm,
+            center_x_mm=center_x_mm,
+            center_y_mm=center_y_mm,
+        )
+
+    result = _worker.call(_job, timeout=120.0)
+    return asdict(result)
+
 
 
 @mcp.tool()

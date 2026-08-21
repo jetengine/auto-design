@@ -10,7 +10,8 @@ readme = "README.md"
 #   开发建议：在 Mac 上编辑代码 + 提交，在 Windows 上安装依赖 + 运行。
 dependencies = [
     "pywin32; sys_platform == 'win32'",
-    "mcp>=1.0.0",
+    # 锁定 1.x：本项目用 FastMCP（mcp.server.fastmcp），mcp 2.0 重构后已移除该路径。
+    "mcp>=1.2.0,<2",
 ]
 
 [project.optional-dependencies]
