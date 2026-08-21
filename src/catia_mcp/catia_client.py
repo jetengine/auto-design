@@ -285,33 +285,35 @@ class CatiaClient:
         step_written = False
         step_size = None
         final_step_path = step_path
-        if not self._export_step_with_retry(part_doc, step_path):
+        export_file = self._export_step_with_retry(part_doc, step_path)
+        if export_file is None:
             head, tail = os.path.split(step_path)
             name, ext = os.path.splitext(tail)
             retry_path = os.path.join(head, f"{name}_retry{ext}")
-            if self._export_step_with_retry(part_doc, retry_path):
-                final_step_path = retry_path
-                step_written = os.path.isfile(final_step_path) and os.path.getsize(final_step_path) > 0
-                step_size = os.path.getsize(final_step_path) if os.path.isfile(final_step_path) else None
-            else:
-                reimported_vol = None
-                match = None
-                rel_err = None
-                return ExportResult(
-                    catpart_path=catpart_path,
-                    catpart_saved=catpart_saved,
-                    step_path=final_step_path,
-                    step_written=False,
-                    step_size_bytes=None,
-                    source_volume_mm3=source_vol,
-                    reimported_volume_mm3=None,
-                    volume_match=None,
-                    relative_error=None,
-                )
+            export_file = self._export_step_with_retry(part_doc, retry_path)
+            if export_file is not None:
+                final_step_path = export_file
         else:
-            step_written = os.path.isfile(step_path) and os.path.getsize(step_path) > 0
-            step_size = os.path.getsize(step_path) if os.path.isfile(step_path) else None
-            final_step_path = step_path
+            final_step_path = export_file
+
+        if export_file is None:
+            reimported_vol = None
+            match = None
+            rel_err = None
+            return ExportResult(
+                catpart_path=catpart_path,
+                catpart_saved=catpart_saved,
+                step_path=final_step_path,
+                step_written=False,
+                step_size_bytes=None,
+                source_volume_mm3=source_vol,
+                reimported_volume_mm3=None,
+                volume_match=None,
+                relative_error=None,
+            )
+
+        step_written = os.path.isfile(final_step_path) and os.path.getsize(final_step_path) > 0
+        step_size = os.path.getsize(final_step_path) if step_written else None
 
         # 5) 实时文件验证：确认 STEP 真的写出来了
         if step_written:
@@ -320,19 +322,19 @@ class CatiaClient:
         # 6) STEP 回读：重新打开导入并测体积
         reimported_vol: Optional[float] = None
         if step_written:
-            reimported_vol = self._reimport_step_volume(app, step_path)
+            reimported_vol = self._reimport_step_volume(app, final_step_path)
 
         # 7) 比对
         match: Optional[bool] = None
         rel_err: Optional[float] = None
-        if source_vol and reimported_vol:
+        if source_vol is not None and reimported_vol is not None:
             rel_err = abs(reimported_vol - source_vol) / source_vol
             match = rel_err <= volume_tolerance
 
         return ExportResult(
             catpart_path=catpart_path,
             catpart_saved=catpart_saved,
-            step_path=step_path,
+            step_path=final_step_path,
             step_written=step_written,
             step_size_bytes=step_size,
             source_volume_mm3=source_vol,
@@ -342,8 +344,8 @@ class CatiaClient:
         )
 
     # ------------------------------------------------------------------
-    def _export_step_with_retry(self, part_doc, step_path: str) -> bool:
-        """STEP 导出重试：先清理旧文件，再尝试一组标准格式名。"""
+    def _export_step_with_retry(self, part_doc, step_path: str) -> Optional[str]:
+        """STEP 导出重试：先清理旧文件，再尝试标准格式名；最后回落到同目录中最新的 STEP 文件。"""
         candidates = [
             (step_path, "stp"),
             (step_path, "STEP"),
@@ -354,11 +356,39 @@ class CatiaClient:
                 if os.path.exists(target_path):
                     os.remove(target_path)
                 part_doc.ExportData(target_path, fmt)
-                if os.path.isfile(target_path) and os.path.getsize(target_path) > 0:
-                    return True
+                resolved = self._find_recent_step_file(target_path)
+                if resolved is not None:
+                    return resolved
             except (pythoncom.com_error, OSError):  # type: ignore[attr-defined]
                 continue
-        return False
+        return None
+
+    def _find_recent_step_file(self, preferred_path: str) -> Optional[str]:
+        """在同目录里找最近生成的 STEP 文件，兼容 CATIA 把扩展名或名称改写的情况。"""
+        if preferred_path and os.path.isfile(preferred_path) and os.path.getsize(preferred_path) > 0:
+            return preferred_path
+
+        directory = os.path.dirname(preferred_path) or "."
+        stem = os.path.splitext(os.path.basename(preferred_path))[0]
+        matches: list[str] = []
+        try:
+            for name in os.listdir(directory):
+                lower = name.lower()
+                if not lower.endswith((".stp", ".step")):
+                    continue
+                full_path = os.path.join(directory, name)
+                if not os.path.isfile(full_path):
+                    continue
+                if os.path.getsize(full_path) <= 0:
+                    continue
+                if name.lower().startswith(stem.lower()):
+                    matches.append(full_path)
+        except OSError:
+            return None
+
+        if not matches:
+            return None
+        return max(matches, key=os.path.getmtime)
 
     # ------------------------------------------------------------------
     def _validate_output_path(self, path: str, allowed_ext: set[str]) -> str:
