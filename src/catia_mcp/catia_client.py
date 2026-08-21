@@ -69,7 +69,8 @@ class ExportResult:
     reimported_volume_mm3: Optional[float]  # STEP 回读后重新测得的体积
     volume_match: Optional[bool]          # 回读体积是否与原始吻合（容差内）
     relative_error: Optional[float]       # 相对误差
-    export_error: Optional[str] = None    # STEP 导出失败时的真实 COM 错误（诊断用）
+    export_error: Optional[str] = None    # 导出失败时的真实 COM 错误（诊断用）
+    format_used: Optional[str] = None     # 实际成功使用的中性格式（如 stp / igs）
 
 
 class CatiaClient:
@@ -280,21 +281,29 @@ class CatiaClient:
         step_path: str,
         catpart_path: Optional[str] = None,
         volume_tolerance: float = 1e-2,
+        preferred_formats: Optional[list[tuple[str, str]]] = None,
     ) -> ExportResult:
-        """把当前活动 Part 安全保存为 CATPart（可选）并导出 STEP，再回读 STEP 验证体积。
+        """把当前活动 Part 安全保存为 CATPart（可选）并导出中性格式，再回读验证体积。
 
-        对应工程验证原则 5「STEP 回读」：导出中性格式后重新导入，比对体积，
-        防止导出过程中的几何丢失/退化。容差默认 1%（STEP 转换会有微小误差）。
+        对应工程验证原则 5「回读」：导出中性格式后重新导入，比对体积，
+        防止导出过程中的几何丢失/退化。容差默认 1%（格式转换会有微小误差）。
+
+        格式策略：默认优先 STEP，STEP 未授权时自动降级到 IGES（B-rep 精确交换格式）。
+        实际使用的格式写入 result.format_used。
 
         参数：
-            step_path:    STEP 导出路径（.stp / .step）
+            step_path:    首选导出路径（.stp / .step / .igs）；降级时自动换成对应扩展名
             catpart_path: 可选，同时安全保存 .CATPart
             volume_tolerance: 体积相对误差容差
+            preferred_formats: 可选，[(格式串, 扩展名)] 优先级列表；默认 STEP→IGES
         """
         app = self._require_app()
 
+        if preferred_formats is None:
+            preferred_formats = [("stp", ".stp"), ("igs", ".igs")]
+
         # 0) 校验输出路径（实时文件验证 = 安全边界）
-        step_path = self._validate_output_path(step_path, {".stp", ".step"})
+        step_path = self._validate_output_path(step_path, {".stp", ".step", ".igs"})
         if catpart_path is not None:
             catpart_path = self._validate_output_path(catpart_path, {".catpart"})
 
@@ -330,26 +339,17 @@ class CatiaClient:
             if final_catpart_path is not None and final_catpart_path != catpart_path:
                 catpart_path = final_catpart_path
 
-        # 4) 导出 STEP（文件名冲突/写入状态是常见失败点，做一次重试 + 唯一名兜底）
-        step_written = False
-        step_size = None
-        final_step_path = step_path
-        export_file, export_error = self._export_step_with_retry(part_doc, step_path)
-        if export_file is None:
-            head, tail = os.path.split(step_path)
-            name, ext = os.path.splitext(tail)
-            retry_path = os.path.join(head, f"{name}_retry{ext}")
-            export_file, export_error = self._export_step_with_retry(part_doc, retry_path)
-            if export_file is not None:
-                final_step_path = export_file
-        else:
-            final_step_path = export_file
+        # 4) 导出中性格式：按优先级依次尝试（STEP 不可用时自动降级到 IGES）
+        base_no_ext = os.path.splitext(step_path)[0]
+        export_file, format_used, export_error = self._export_first_available(
+            part_doc, base_no_ext, preferred_formats
+        )
 
         if export_file is None:
             return ExportResult(
                 catpart_path=catpart_path,
                 catpart_saved=catpart_saved,
-                step_path=final_step_path,
+                step_path=step_path,
                 step_written=False,
                 step_size_bytes=None,
                 source_volume_mm3=source_vol,
@@ -357,21 +357,19 @@ class CatiaClient:
                 volume_match=None,
                 relative_error=None,
                 export_error=export_error,
+                format_used=None,
             )
 
+        final_step_path = export_file
         step_written = os.path.isfile(final_step_path) and os.path.getsize(final_step_path) > 0
         step_size = os.path.getsize(final_step_path) if step_written else None
 
-        # 5) 实时文件验证：确认 STEP 真的写出来了
-        if step_written:
-            step_size = os.path.getsize(final_step_path) if os.path.isfile(final_step_path) else None
-
-        # 6) STEP 回读：重新打开导入并测体积
+        # 5) 中性格式回读：重新打开导入并测体积（尽力而为，表面型导入可能测不出固体体积）
         reimported_vol: Optional[float] = None
         if step_written:
             reimported_vol = self._reimport_step_volume(app, final_step_path)
 
-        # 7) 比对
+        # 6) 比对
         match: Optional[bool] = None
         rel_err: Optional[float] = None
         if source_vol is not None and reimported_vol is not None:
@@ -389,51 +387,53 @@ class CatiaClient:
             volume_match=match,
             relative_error=rel_err,
             export_error=None,
+            format_used=format_used,
         )
 
     # ------------------------------------------------------------------
-    def _export_step_with_retry(self, part_doc, step_path: str):
-        """STEP 导出重试。
+    def _export_first_available(self, part_doc, base_no_ext: str, formats: list[tuple[str, str]]):
+        """按优先级依次尝试导出，返回第一个成功的。
 
-        返回 (resolved_path, error_msg)：
-            - 成功：(实际写出的文件路径, None)
-            - 失败：(None, 最后一次真实错误文本)  ← 不再吞掉错误，便于诊断许可证/格式问题
+        返回 (resolved_path, format_used, error_msg)：
+            - 成功：(实际写出的文件路径, 格式串, None)
+            - 全部失败：(None, None, 汇总错误文本)  ← 不吞错误，便于诊断
         """
-        candidates = [
-            (step_path, "stp"),
-            (step_path, "STEP"),
-            (step_path, "STP"),
-        ]
-        last_error: Optional[str] = None
-        for target_path, fmt in candidates:
+        errors: list[str] = []
+        for fmt, ext in formats:
+            target = f"{base_no_ext}{ext}"
             try:
-                if os.path.exists(target_path):
-                    os.remove(target_path)
-                part_doc.ExportData(target_path, fmt)
-                resolved = self._find_recent_step_file(target_path)
+                if os.path.exists(target):
+                    os.remove(target)
+                part_doc.ExportData(target, fmt)
+                resolved = self._find_recent_step_file(target)
                 if resolved is not None:
-                    return resolved, None
-                last_error = f"ExportData(fmt={fmt!r}) 返回成功但未找到非空 STEP 文件（可能无 STEP 转换器许可证）。"
+                    return resolved, fmt, None
+                errors.append(f"{fmt}: 调用未报错但无非空文件（多半未授权）")
             except pythoncom.com_error as exc:  # type: ignore[attr-defined]
-                last_error = f"ExportData(fmt={fmt!r}) 抛 COM 错误：{exc}"
-                continue
+                errors.append(f"{fmt}: COM {exc}")
             except OSError as exc:
-                last_error = f"文件操作失败(fmt={fmt!r})：{exc}"
-                continue
-        return None, last_error
+                errors.append(f"{fmt}: OS {exc}")
+        return None, None, " | ".join(errors) if errors else "无可用导出格式"
 
     def _find_recent_step_file(self, preferred_path: str) -> Optional[str]:
-        """在同目录里找最近生成的 STEP 文件，兼容 CATIA 把扩展名或名称改写的情况。"""
+        """确认导出文件真实写出；兼容 CATIA 偶发的扩展名改写。
+
+        优先返回精确路径；找不到时回落到同目录中同名（同 stem）最新的中性文件。
+        """
         if preferred_path and os.path.isfile(preferred_path) and os.path.getsize(preferred_path) > 0:
             return preferred_path
 
         directory = os.path.dirname(preferred_path) or "."
         stem = os.path.splitext(os.path.basename(preferred_path))[0]
+        want_ext = os.path.splitext(preferred_path)[1].lower()
+        # 只在这些中性格式扩展名里回落，避免误取到无关文件
+        neutral_ext = {".stp", ".step", ".igs", ".iges", ".stl", ".wrl", ".model", ".cgr"}
+        allowed = {want_ext} if want_ext in neutral_ext else neutral_ext
         matches: list[str] = []
         try:
             for name in os.listdir(directory):
                 lower = name.lower()
-                if not lower.endswith((".stp", ".step")):
+                if os.path.splitext(lower)[1] not in allowed:
                     continue
                 full_path = os.path.join(directory, name)
                 if not os.path.isfile(full_path):

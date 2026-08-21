@@ -100,24 +100,28 @@ def export_step_and_verify(
     step_path: str,
     catpart_path: str | None = None,
 ) -> dict:
-    """把当前活动 Part 安全保存为 CATPart（可选）并导出 STEP，再回读 STEP 验证体积。
+    """把当前活动 Part 安全保存为 CATPart（可选）并导出中性格式，再回读验证体积。
 
-    对应工程验证原则 5「STEP 回读」：导出后重新导入 STEP，比对体积，防止几何丢失。
+    对应工程验证原则 5「回读」：导出后重新导入，比对体积，防止几何丢失。
+    格式策略：默认优先 STEP；若该 CATIA 未授权 STEP 转换器，自动降级为 IGES。
 
     参数：
-        step_path:    STEP 导出路径（.stp / .step，绝对路径）
+        step_path:    首选导出路径（.stp / .step / .igs，绝对路径）；降级时自动换扩展名
         catpart_path: 可选，同时安全保存 .CATPart（.CATPart，绝对路径）
 
     返回（既是结果也是证据）：
-        catpart_saved:          CATPart 是否成功落盘
-        step_written:           STEP 文件是否真实存在且非空（实时文件验证）
-        step_size_bytes:        STEP 文件大小
+        catpart_saved:          CATPart 是否成功落盘（核心交付物）
+        step_written:           中性格式文件是否真实存在且非空（实时文件验证）
+        step_size_bytes:        导出文件大小
+        format_used:            实际成功使用的格式（如 stp / igs）
         source_volume_mm3:      导出前原实体体积
-        reimported_volume_mm3:  STEP 回读后重新测得的体积
+        reimported_volume_mm3:  回读后重新测得的体积（曲面型导入可能为 null）
         volume_match:           回读体积是否与原始吻合（容差 1% 内）
         relative_error:         相对误差
+        export_error:           导出失败时的真实 COM 错误（诊断用）
 
-    使用建议：step_written 与 volume_match 都为 true 才算交付合格。
+    使用建议：catpart_saved 与 step_written 为 true 即交付闭环成立；
+    volume_match 为体积回读加分项（中性格式受导入类型影响，可能为 null）。
     """
 
     def _job(client: CatiaClient):

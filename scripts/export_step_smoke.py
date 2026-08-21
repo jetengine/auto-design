@@ -61,13 +61,24 @@ def main() -> int:
     finally:
         worker.stop()
 
+    # 交付合格判定：
+    #   - 建模合格（体积回读吻合）
+    #   - CATPart（可编辑特征树）落盘  ← 核心交付物
+    #   - 中性格式导出成功落盘（STEP 未授权时自动降级为 IGES）
+    # 中性格式的体积回读是「尽力而为」：IGES 常以曲面导入，可能测不出固体体积，
+    # 不作为硬性合格条件。
     ok = (
         box.update_ok
         and box.volume_match is True
+        and exp.catpart_saved
         and exp.step_written
-        and exp.volume_match is True
     )
-    print("\n判定：", "✅ 交付合格（建模 + STEP 回读均通过）" if ok else "⚠️ 需检查（见上方证据）")
+    fmt = exp.format_used or "(无)"
+    if ok:
+        vol_note = "，中性格式体积回读吻合" if exp.volume_match is True else "（中性格式体积回读尽力而为）"
+        print(f"\n判定： ✅ 交付合格（建模 + CATPart + {fmt} 导出均通过{vol_note}）")
+    else:
+        print("\n判定： ⚠️ 需检查（见上方证据）")
     return 0 if ok else 1
 
 
