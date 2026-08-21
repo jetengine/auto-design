@@ -140,7 +140,8 @@ class MeasureResult:
     area_mm2: Optional[float]             # 表面积 —— 与体积互相独立的第二条证据
     cog_mm: Optional[tuple]               # 重心 (x, y, z)，第三条独立证据
     cog_strategy: Optional[str] = None    # GetCOG 是靠哪种调用姿势成功的（自证）
-    errors: Optional[list] = None         # 各项测量失败时的原始 COM 报错
+    cog_attempts: Optional[list] = None   # 成功前试过但不行的姿势（预期内，跨机器排障用）
+    errors: Optional[list] = None         # 真正导致某项测不出来的原始报错
 
 
 @dataclass
@@ -341,7 +342,10 @@ class CatiaClient:
 
         volume = self._read_si(measurable, "Volume", 1e9, errors)
         area = self._read_si(measurable, "Area", 1e6, errors)
-        cog, cog_strategy = self._read_cog_mm(measurable, errors, app)
+        cog, cog_strategy, cog_attempts = self._read_cog_mm(measurable, app)
+        if cog is None:
+            # 没拿到重心，那些尝试记录就不再是背景噪声，而是唯一的线索
+            errors.extend(cog_attempts)
 
         return MeasureResult(
             document_name=str(doc.Name),
@@ -350,6 +354,7 @@ class CatiaClient:
             area_mm2=area,
             cog_mm=cog,
             cog_strategy=cog_strategy,
+            cog_attempts=cog_attempts or None,
             errors=errors or None,
         )
 
@@ -418,43 +423,57 @@ class CatiaClient:
             return None
 
     @staticmethod
-    def _read_cog_mm(measurable, errors: list, app=None):
-        """读重心，返回 ((x, y, z) mm, 生效的调用姿势)。
+    def _read_cog_mm(measurable, app=None):
+        """读重心，返回 ((x, y, z) mm, 生效的姿势, 试过但不行的姿势列表)。
 
-        ── 这里踩到的坑，比「调用失败」更值得记 ──
-        `GetCOG` 不是返回值，而是**出参数组**（`CATSafeArrayVariant`）。第一版
-        试了两种姿势，实测结果是：
+        ── 坑一：一个「不报错但说谎」的调用姿势 ──
+        `GetCOG` 不是返回值，而是**出参数组**（`CATSafeArrayVariant`）。实测：
 
-            byref VARIANT(VT_R8) → 直接报错 "Objects for SAFEARRAYS must be
-                                   sequences (of sequences), or a buffer object"
-            直接传 list          → **不报错，但返回全零**
+            byref VARIANT(VT_VARIANT / VT_R8) → 报错 "Objects for SAFEARRAYS
+                                                must be sequences ..."
+            直接传 list                        → **不报错，但缓冲区一个字节没变**
 
-        第二种才是真正危险的那个：pywin32 把 list 按值传了进去，CATIA 写回的是
-        那份副本，我们读到的原 list 一个字节都没变。**它没有失败，它在说谎。**
-        一个静默返回错误数据的策略，比一个抛异常的策略危险得多 —— 后者会停下来，
-        前者会一路把错误数据带进结论里。
+        第二种才是危险的那个：pywin32 把 list 按值传了进去，CATIA 写回的是那份
+        副本。**它没有失败，它在说谎。** 静默返回错误数据比抛异常危险得多——
+        后者会停下来，前者会把假数据一路带进结论。
 
-        ── 对策：哨兵值 ──
-        缓冲区不填 0，填一个真实重心绝无可能取到的magic number。调用完如果三个
-        分量**还是哨兵值**，就证明 CATIA 根本没写回来，判为失败换下一种姿势。
-        不能简单地「见到 (0,0,0) 就当失败」—— 一个居中建模的零件重心本来就是原点，
-        那样会把正确结果误杀。哨兵值区分的是「没被写」而不是「值恰好是零」。
+        对策是**哨兵值**：缓冲区不填 0，填一个真实重心绝无可能取到的量级；调用完
+        若三个分量还是哨兵值，就判定「没被写回」。不能图省事写成「见到 (0,0,0)
+        就算失败」—— 居中建模的零件重心本来就是原点，那样会误杀正确结果。
+        哨兵区分的是「没被写」，而不是「值恰好为零」。
+
+        ── 坑二：CATIA 自己的单位不一致（实测）──
+        同一个 Measurable 上：
+
+            Volume → m³      （×1e9 → mm³）
+            Area   → m²      （×1e6 → mm²）
+            GetCOG → **mm**  （×1，不用换算）
+
+        这不是笔误，是实测结果：40×30×20 的块，GetCOG 直接给回 (20, 15, 10)。
+        按 SI 惯例乘 1e3 会得到 (20000, 15000, 10000)——差整整 1000 倍。
+        所以别推断单位，逐个用已知精确解钉死。
+
+        ── 真正跑通的是 VBA 跳板 ──
+        绕开 pywin32 的出参 marshalling：让 CATIA 内部跑一小段 VBScript 把数组
+        接住，再当**返回值**递出来。代价是需要脚本执行权限（企业环境可能被锁），
+        所以放在最后试。
         """
-        sentinel = -1.2345678901e9  # 真实重心（米）不可能取到这个量级
+        sentinel = -1.2345678901e9  # 真实重心不可能取到这个量级
+        attempts: list = []
 
         def _harvest(vals, label):
-            """把出参缓冲区换算成 mm；没被写回则返回 None 并记原因。"""
+            """把出参缓冲区收成 mm；没被写回则返回 None 并记原因。"""
             vals = [float(v) for v in (vals or [])]
             if len(vals) < 3:
-                errors.append(f"GetCOG({label}): 只拿到 {len(vals)} 个分量")
+                attempts.append(f"GetCOG({label}): 只拿到 {len(vals)} 个分量")
                 return None
             if all(v == sentinel for v in vals[:3]):
-                errors.append(f"GetCOG({label}): 出参没被写回（缓冲区仍是哨兵值）")
+                attempts.append(f"GetCOG({label}): 出参没被写回（缓冲区仍是哨兵值）")
                 return None
-            return tuple(v * 1e3 for v in vals[:3])  # SI 米 → mm
+            return tuple(vals[:3])  # GetCOG 已经是 mm，不换算
 
         # 姿势 A/B：byref VARIANT。CATSafeArrayVariant 的元素类型是 VARIANT，
-        # 所以先试 VT_VARIANT，再退回 VT_R8。
+        # 所以先试 VT_VARIANT，再退回 VT_R8。（本机两者都不行，留作跨机器兜底）
         variant_kinds = (
             ("VT_ARRAY|VT_BYREF|VT_VARIANT", pythoncom.VT_ARRAY | pythoncom.VT_BYREF | pythoncom.VT_VARIANT),
             ("VT_ARRAY|VT_BYREF|VT_R8", pythoncom.VT_ARRAY | pythoncom.VT_BYREF | pythoncom.VT_R8),
@@ -465,24 +484,21 @@ class CatiaClient:
                 measurable.GetCOG(arr)
                 got = _harvest(arr.value, label)
                 if got is not None:
-                    return got, f"VARIANT({label})"
+                    return got, f"VARIANT({label})", attempts
             except (AttributeError, pythoncom.com_error, ValueError, TypeError) as exc:  # type: ignore[attr-defined]
-                errors.append(f"GetCOG({label}): {exc}")
+                attempts.append(f"GetCOG({label}): {exc}")
 
-        # 姿势 C：直接传 list。已知会静默说谎，靠哨兵拦住；留着是为了换机器时
-        # 万一 pywin32 行为不同，它能顶上。
+        # 姿势 C：直接传 list。已知会静默说谎，靠哨兵拦住。
         try:
             buf = [sentinel, sentinel, sentinel]
             out = measurable.GetCOG(buf)
             got = _harvest(out if out is not None else buf, "plain list")
             if got is not None:
-                return got, "plain list"
+                return got, "plain list", attempts
         except (AttributeError, pythoncom.com_error, ValueError, TypeError) as exc:  # type: ignore[attr-defined]
-            errors.append(f"GetCOG(plain list): {exc}")
+            attempts.append(f"GetCOG(plain list): {exc}")
 
-        # 姿势 D：VBA 跳板。绕开 pywin32 的出参 marshalling —— 让 CATIA 自己在
-        # 内部跑一小段 VBScript 把数组接住再当返回值递出来。这是 pycatia 对同类
-        # 出参方法的通行解法，代价是需要脚本执行权限（企业环境可能被锁）。
+        # 姿势 D：VBA 跳板 —— 本机实测生效的就是这条（lang=2）。
         if app is not None:
             vba = (
                 "Function GetCOGArray(m)\n"
@@ -497,11 +513,11 @@ class CatiaClient:
                     out = app.SystemService.Evaluate(vba, lang, "GetCOGArray", [measurable])
                     got = _harvest(list(out) if out is not None else [], f"VBA(lang={lang})")
                     if got is not None:
-                        return got, f"SystemService.Evaluate(lang={lang})"
+                        return got, f"SystemService.Evaluate(lang={lang})", attempts
                 except (AttributeError, pythoncom.com_error, ValueError, TypeError) as exc:  # type: ignore[attr-defined]
-                    errors.append(f"GetCOG(VBA lang={lang}): {exc}")
+                    attempts.append(f"GetCOG(VBA lang={lang}): {exc}")
 
-        return None, None
+        return None, None, attempts
 
     # ------------------------------------------------------------------
     # 写操作（原生特征）
