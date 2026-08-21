@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 import traceback
 from dataclasses import asdict
 
@@ -29,15 +30,17 @@ def main() -> int:
         return 2
 
     out_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "out"))
-    catpart_path = os.path.join(out_dir, "SmokeBox.CATPart")
-    step_path = os.path.join(out_dir, "SmokeBox.step")
+    # 用时间戳生成唯一名：避免与 CATIA 会话中已打开的同名文档撞名
+    tag = time.strftime("%Y%m%d_%H%M%S")
+    catpart_path = os.path.join(out_dir, f"SmokeBox_{tag}.CATPart")
+    step_path = os.path.join(out_dir, f"SmokeBox_{tag}.step")
 
     worker = ComWorker()
     try:
         worker.start()
 
         box = worker.call(
-            lambda c: c.create_box(100.0, 60.0, 20.0, part_name="SmokeBox"),
+            lambda c: c.create_box(100.0, 60.0, 20.0, part_name=f"SmokeBox_{tag}"),
             timeout=120.0,
         )
         print("① 建模证据：")

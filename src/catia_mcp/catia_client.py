@@ -69,6 +69,7 @@ class ExportResult:
     reimported_volume_mm3: Optional[float]  # STEP 回读后重新测得的体积
     volume_match: Optional[bool]          # 回读体积是否与原始吻合（容差内）
     relative_error: Optional[float]       # 相对误差
+    export_error: Optional[str] = None    # STEP 导出失败时的真实 COM 错误（诊断用）
 
 
 class CatiaClient:
@@ -285,21 +286,18 @@ class CatiaClient:
         step_written = False
         step_size = None
         final_step_path = step_path
-        export_file = self._export_step_with_retry(part_doc, step_path)
+        export_file, export_error = self._export_step_with_retry(part_doc, step_path)
         if export_file is None:
             head, tail = os.path.split(step_path)
             name, ext = os.path.splitext(tail)
             retry_path = os.path.join(head, f"{name}_retry{ext}")
-            export_file = self._export_step_with_retry(part_doc, retry_path)
+            export_file, export_error = self._export_step_with_retry(part_doc, retry_path)
             if export_file is not None:
                 final_step_path = export_file
         else:
             final_step_path = export_file
 
         if export_file is None:
-            reimported_vol = None
-            match = None
-            rel_err = None
             return ExportResult(
                 catpart_path=catpart_path,
                 catpart_saved=catpart_saved,
@@ -310,6 +308,7 @@ class CatiaClient:
                 reimported_volume_mm3=None,
                 volume_match=None,
                 relative_error=None,
+                export_error=export_error,
             )
 
         step_written = os.path.isfile(final_step_path) and os.path.getsize(final_step_path) > 0
@@ -341,16 +340,23 @@ class CatiaClient:
             reimported_volume_mm3=reimported_vol,
             volume_match=match,
             relative_error=rel_err,
+            export_error=None,
         )
 
     # ------------------------------------------------------------------
-    def _export_step_with_retry(self, part_doc, step_path: str) -> Optional[str]:
-        """STEP 导出重试：先清理旧文件，再尝试标准格式名；最后回落到同目录中最新的 STEP 文件。"""
+    def _export_step_with_retry(self, part_doc, step_path: str):
+        """STEP 导出重试。
+
+        返回 (resolved_path, error_msg)：
+            - 成功：(实际写出的文件路径, None)
+            - 失败：(None, 最后一次真实错误文本)  ← 不再吞掉错误，便于诊断许可证/格式问题
+        """
         candidates = [
             (step_path, "stp"),
             (step_path, "STEP"),
             (step_path, "STP"),
         ]
+        last_error: Optional[str] = None
         for target_path, fmt in candidates:
             try:
                 if os.path.exists(target_path):
@@ -358,10 +364,15 @@ class CatiaClient:
                 part_doc.ExportData(target_path, fmt)
                 resolved = self._find_recent_step_file(target_path)
                 if resolved is not None:
-                    return resolved
-            except (pythoncom.com_error, OSError):  # type: ignore[attr-defined]
+                    return resolved, None
+                last_error = f"ExportData(fmt={fmt!r}) 返回成功但未找到非空 STEP 文件（可能无 STEP 转换器许可证）。"
+            except pythoncom.com_error as exc:  # type: ignore[attr-defined]
+                last_error = f"ExportData(fmt={fmt!r}) 抛 COM 错误：{exc}"
                 continue
-        return None
+            except OSError as exc:
+                last_error = f"文件操作失败(fmt={fmt!r})：{exc}"
+                continue
+        return None, last_error
 
     def _find_recent_step_file(self, preferred_path: str) -> Optional[str]:
         """在同目录里找最近生成的 STEP 文件，兼容 CATIA 把扩展名或名称改写的情况。"""
