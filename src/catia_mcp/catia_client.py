@@ -74,6 +74,9 @@ class PocketResult:
     measured_removed_mm3: Optional[float]  # 实测去料体积 = before − after
     volume_match: Optional[bool]           # 实测去料是否与理论吻合（容差内）
     relative_error: Optional[float]        # 相对误差
+    strategy: str = ""                     # 实际生效的草图平面策略（见 _make_pocket_sketch）
+    pocket_from: str = ""                  # "top"=从顶面向下挖；"bottom"=从底面向上挖（退化路径）
+    plane_errors: Optional[list] = None    # 各失败策略的报错，定位环境差异用
 
 
 
@@ -290,15 +293,12 @@ class CatiaClient:
         # 0) 挖槽前体积证据
         vol_before = self._measure_volume_mm3(part_doc, part, body)
 
-        # 1) 在 XY 面上方 at_height 处建偏移平面（法向 +Z，与顶面共面）
-        hsf = part.HybridShapeFactory
-        ref_xy = part.CreateReferenceFromObject(part.OriginElements.PlaneXY)
-        offset_plane = hsf.AddNewPlaneOffset(ref_xy, float(at_height_mm), False)
-        body.InsertHybridShape(offset_plane)
-        part.InWorkObject = body
-        part.Update()
+        # 1) 拿一个可画草图的平面并建草图（偏移平面优先，拿不到就退到 PlaneXY 从底面挖）
+        sketch, strategy, from_top, plane_errors = self._make_pocket_sketch(
+            part, body, float(at_height_mm)
+        )
 
-        # 2) 在偏移平面上画居中矩形（平面 H/V 轴与全局 X/Y 对齐）
+        # 2) 画居中矩形（草图 H/V 轴与全局 X/Y 对齐）
         pl = float(pocket_length_mm)
         pw = float(pocket_width_mm)
         cx = float(center_x_mm) if center_x_mm is not None else pl  # 默认与长方体中心对齐由调用方保证
@@ -306,8 +306,6 @@ class CatiaClient:
         x0, x1 = cx - pl / 2.0, cx + pl / 2.0
         y0, y1 = cy - pw / 2.0, cy + pw / 2.0
 
-        # 与 create_box 一致：直接把平面对象喂给 Sketches.Add（包一层 Reference 反而报 Add failed）
-        sketch = body.Sketches.Add(offset_plane)
         factory_2d = sketch.OpenEdition()
         factory_2d.CreateLine(x0, y0, x1, y0)
         factory_2d.CreateLine(x1, y0, x1, y1)
@@ -315,10 +313,18 @@ class CatiaClient:
         factory_2d.CreateLine(x0, y1, x0, y0)
         sketch.CloseEdition()
 
-        # 3) Pocket 去料：偏移平面法向为 +Z，Pocket 默认沿 -Z 向下挖 depth
+        # 3) Pocket 去料
         part.InWorkObject = body
         shape_factory = part.ShapeFactory
         pocket = shape_factory.AddNewPocket(sketch, float(depth_mm))
+
+        # 顶面偏移平面：法向 +Z，Pocket 默认沿 -Z 向下挖，方向天然正确。
+        # 退化到 PlaneXY 时草图在 Z=0，必须把挖料方向翻成 +Z 才能吃到料。
+        if not from_top:
+            try:
+                pocket.DirectionOrientation = 1  # catInverseOrientation
+            except (AttributeError, pythoncom.com_error):  # type: ignore[attr-defined]
+                plane_errors.append("DirectionOrientation 反向失败，去料方向可能背离实体")
 
         # 4) 更新检查
         update_ok = True
@@ -354,6 +360,58 @@ class CatiaClient:
             measured_removed_mm3=measured_removed,
             volume_match=match,
             relative_error=rel_err,
+            strategy=strategy,
+            pocket_from="top" if from_top else "bottom",
+            plane_errors=plane_errors or None,
+        )
+
+    def _make_pocket_sketch(self, part, body, at_height_mm: float):
+        """在 PartBody 上建出槽轮廓草图，按稳健度依次降级，并记录每次失败原因。
+
+        为什么要降级链：`AddNewPlaneOffset` 造出的平面必须先被挂进某个容器并 Update
+        才有真实几何，否则 `Sketches.Add` 直接报 “The method Add failed”。而挂进
+        PartBody 只在 Part 开了 Hybrid Design 时才成立——这台机器上就不成立。
+
+        返回 (sketch, strategy, from_top, errors)
+        """
+        errors: list = []
+
+        # 策略 A：几何图形集（HybridBody）——任何 Part 都有，不依赖 Hybrid Design 开关
+        try:
+            hsf = part.HybridShapeFactory
+            ref_xy = part.CreateReferenceFromObject(part.OriginElements.PlaneXY)
+            hybrid_body = part.HybridBodies.Add()
+            try:
+                hybrid_body.Name = "PocketPlanes"
+            except pythoncom.com_error:  # type: ignore[attr-defined]
+                pass
+            plane = hsf.AddNewPlaneOffset(ref_xy, at_height_mm, False)
+            hybrid_body.AppendHybridShape(plane)
+            part.InWorkObject = hybrid_body
+            part.Update()
+            part.InWorkObject = body
+            for as_ref in (False, True):
+                candidate = part.CreateReferenceFromObject(plane) if as_ref else plane
+                try:
+                    return (
+                        body.Sketches.Add(candidate),
+                        f"hybrid_body_offset_plane(ref={as_ref})",
+                        True,
+                        errors,
+                    )
+                except pythoncom.com_error as exc:  # type: ignore[attr-defined]
+                    errors.append(f"A/ref={as_ref}: {exc}")
+        except pythoncom.com_error as exc:  # type: ignore[attr-defined]
+            errors.append(f"A/setup: {exc}")
+
+        # 策略 B：退化——直接用 PlaneXY（create_box 已证明可用），改由 Pocket 反向挖
+        errors.append("降级到 PlaneXY，改从底面向上挖（体积证据等价，位置在底部）")
+        part.InWorkObject = body
+        return (
+            body.Sketches.Add(part.OriginElements.PlaneXY),
+            "origin_plane_xy_reversed",
+            False,
+            errors,
         )
 
     # ------------------------------------------------------------------
