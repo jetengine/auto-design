@@ -306,7 +306,8 @@ class CatiaClient:
         x0, x1 = cx - pl / 2.0, cx + pl / 2.0
         y0, y1 = cy - pw / 2.0, cy + pw / 2.0
 
-        sketch = body.Sketches.Add(part.CreateReferenceFromObject(offset_plane))
+        # 与 create_box 一致：直接把平面对象喂给 Sketches.Add（包一层 Reference 反而报 Add failed）
+        sketch = body.Sketches.Add(offset_plane)
         factory_2d = sketch.OpenEdition()
         factory_2d.CreateLine(x0, y0, x1, y0)
         factory_2d.CreateLine(x1, y0, x1, y1)
