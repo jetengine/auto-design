@@ -487,9 +487,20 @@ for ref in refs[1:]:
 
 特征树上就是干净的一个 `EdgeFillet`，而不是 12 个碎特征。
 
-额外好处：**边的条数本身就是证据**。长方体应当正好 12 条，所以结果里带 `objects_filleted`——数量不对，立刻就知道拾取出了问题，不用等体积对不上才发现。
+搜索串在不同版本/语言环境下写法略有差异，所以按序试了三种（`Topology.CGMEdge,all` / `,sel` / 带引号形式），生效的记进 `strategy`。实测第一种即通过。
 
-搜索串在不同版本/语言环境下写法略有差异，所以按序试了三种（`Topology.CGMEdge,all` / `,sel` / 带引号形式），生效的记进 `strategy`。
+#### 候选数 ≠ 实体边数
+
+实测有个必须讲清的细节：**搜索是全文档范围的**。40×30×20 的长方体捞到 **16 个候选**——12 条实体边 + 4 条草图线。那 4 条被 CATIA 拒绝（`AddObjectToFillet failed`）是**预期行为，不是故障**。
+
+所以结果里同时给两个数：
+
+| 字段               | 含义                   |
+| ------------------ | ---------------------- |
+| `edge_candidates`  | 搜索到的候选总数（16） |
+| `objects_filleted` | 实际倒角成功数（12）   |
+
+差值有据可查，不把预期内的拒绝伪装成错误 —— 否则每次成功的倒角都会附带一堆吓人的红色报错，久而久之就没人看 `target_errors` 了。
 
 ### 11.4 验证用的是精确解，不是估算
 
@@ -524,22 +535,26 @@ python scripts\add_fillet_smoke.py
 ```
 ② 倒圆角证据：
     fillet_name           : EdgeFillet.1
-    strategy              : Search(Topology.CGMEdge,all)/AddNewSolidEdgeFilletWithConstantRadius/edges=12
+    strategy              : Search(Topology.CGMEdge,all)/AddNewSolidEdgeFilletWithConstantRadius/edges=12of16
     update_ok             : True
     volume_before_mm3     : 24000.0
-    volume_after_mm3      : 22235.99
-    measured_removed_mm3  : 1764.01
-    expected_removed_mm3  : 1764.012
+    volume_after_mm3      : 22235.987758454303
+    measured_removed_mm3  : 1764.0122415456972
+    expected_removed_mm3  : 1764.012244017009
     volume_match          : True
+    relative_error        : 1.4e-09
     objects_filleted      : 12
-    target_errors         : None
+    edge_candidates       : 16
+    target_errors         : ['4/16 个候选被 CATIA 拒绝（通常是草图线等非实体边，属预期内）']
 
 判定： ✅ 倒圆角合格（边拾取生效，去料体积与精确解吻合）
 ```
 
+`relative_error` 是 **1.4e-09** —— 不是「差不多对」，是与精确解在浮点精度内一致。这说明 12 条边确实全被拾到、且都按 R5 倒成功了。
+
 **读结果的顺序**：
 
-1. `objects_filleted` —— 拾到几条边？长方体必须是 12。这一步失败说明**拾取**有问题。
+1. `objects_filleted` —— 倒了几条边？长方体必须是 12。这一步失败说明**拾取**有问题。
 2. `volume_match` —— 倒出来对不对？这一步失败说明**几何**有问题。
 3. `strategy` —— 具体是哪条路走通的。
 4. `target_errors` —— 失败时看哪几条路走不通、原文报错是什么。
@@ -552,3 +567,62 @@ python scripts\add_fillet_smoke.py
 它应调用 `add_fillet(radius_mm=5, box_length_mm=40, box_width_mm=30, box_height_mm=20)`，并根据 `update_ok` / `volume_match` 回报是否合格。
 
 > 传 `box_*_mm` 很关键：不传就只有「体积变小了」这种弱验证，传了才有理论值可比对。
+
+---
+
+## 12. 回归：把七个冒烟脚本串成一条命令
+
+### 12.1 为什么现在必须做
+
+到这里已经有 7 个冒烟脚本，每个都**单独**验证通过过。问题在于它们共用同一份 `catia_client.py` 和 `com_worker.py`。
+
+做倒圆角时我顺手动了 `part.InWorkObject` —— Pocket 会不会被打断？没人知道，除非每次都全跑一遍。而**一条命令跑不完的回归，等于没有回归**：只要需要人手敲 7 次、记 7 个判定标准，实际执行率就是零。
+
+```powershell
+python scripts\regression.py              # 全跑
+python scripts\regression.py --list       # 看有哪些步骤
+python scripts\regression.py fillet pocket  # 只跑关键字匹配的
+python scripts\regression.py --skip mcp   # 跳过最慢的端到端
+```
+
+### 12.2 顺序不是随便排的
+
+先证明链路通，再证明能力对，最后跑最慢的端到端：
+
+| 步骤      | 脚本                   | 超时 | 验证内容                        |
+| --------- | ---------------------- | ---- | ------------------------------- |
+| `connect` | `hello_catia.py`       | 60s  | COM 链路 / 版本 / 会话          |
+| `health`  | `health_smoke.py`      | 120s | 超时熔断 + 阻塞自诊断 + 恢复    |
+| `box`     | `create_box_smoke.py`  | 180s | 加料特征（Sketch + Pad）        |
+| `pocket`  | `add_pocket_smoke.py`  | 180s | 去料特征（偏移平面 + Pocket）   |
+| `fillet`  | `add_fillet_smoke.py`  | 180s | 几何引用（边拾取 + Fillet）     |
+| `export`  | `export_step_smoke.py` | 240s | 交付（STEP，降级 IGES）         |
+| `mcp`     | `mcp_client_smoke.py`  | 300s | MCP 端到端（起服务器 + 调工具） |
+
+`probe_export_formats.py` **不在**回归里——它是探测当前机器支持哪些格式的诊断工具，没有固定通过标准，每台机器答案都不同。把它塞进回归只会制造假失败。
+
+### 12.3 四个设计取舍
+
+1. **子进程隔离**。每个脚本单独起进程。一个脚本把 CATIA 搞挂了，下一个还能跑，且能自证「我是在什么状态下失败的」。同进程串跑的话，第一个泄漏的 COM 引用会污染后面所有结论——那种回归的绿灯是骗人的。
+
+2. **不吞输出**。子进程 stdout/stderr 直连终端，证据实时滚出来。捕获再回放会让 3 分钟的运行看起来像卡死了。
+
+3. **硬超时**。CATIA 卡死时不给「再等等看」的余地——超时即杀，记 `TIMEOUT`。**回归脚本自己挂住是最糟的失败模式**：它本来是用来发现卡死的。
+
+4. **前置失败即中止**。连不上 CATIA 时，后面 6 个脚本会吐出 6 份一模一样的连接错误，把真正的第一现场淹掉。所以 `connect` 失败直接停，其余标 `SKIP`。
+
+### 12.4 判定符号
+
+退出码与各冒烟脚本的约定一致：
+
+| 符号 | 判定      | 含义                                      |
+| ---- | --------- | ----------------------------------------- |
+| ✅   | `PASS`    | 退出码 0                                  |
+| ❌   | `FAIL`    | 退出码 1 —— 跑起来了，但证据不合格        |
+| 🚫   | `ENV`     | 退出码 2 —— 环境问题（没装包/CATIA 没开） |
+| ⏱    | `TIMEOUT` | 超时被杀                                  |
+| ⏭   | `SKIP`    | 前置中止的连带结果，重跑它没有意义        |
+
+分开 `FAIL` 和 `ENV` 是有用的：前者是**代码退步了**，后者是**机器没准备好**。混在一起会让人在环境问题上白查半天代码。
+
+结尾只列真正跑过且没过的步骤供单独重跑，`SKIP` 不列。

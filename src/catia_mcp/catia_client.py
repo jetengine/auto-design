@@ -103,6 +103,7 @@ class FilletResult:
     volume_match: Optional[bool]           # 实测与理论是否吻合
     relative_error: Optional[float]
     objects_filleted: Optional[int] = None # 实际倒了多少条边（长方体应为 12，本身就是证据）
+    edge_candidates: Optional[int] = None  # 搜索到的候选总数（含草图线等不可倒角对象）
     target_errors: Optional[list] = None   # 各失败拾取策略的原始 COM 报错
 
 
@@ -507,9 +508,13 @@ class CatiaClient:
         vol_before = self._measure_volume_mm3(part_doc, part, body)
 
         part.InWorkObject = body
-        fillet, strategy, edge_count, target_errors = self._add_fillet_on_edges(
-            part_doc, part, float(radius_mm), propagation
-        )
+        (
+            fillet,
+            strategy,
+            edge_count,
+            candidate_count,
+            target_errors,
+        ) = self._add_fillet_on_edges(part_doc, part, float(radius_mm), propagation)
 
         update_ok = True
         try:
@@ -552,11 +557,12 @@ class CatiaClient:
             volume_match=match,
             relative_error=rel_err,
             objects_filleted=edge_count,
+            edge_candidates=candidate_count,
             target_errors=target_errors or None,
         )
 
     def _add_fillet_on_edges(self, part_doc, part, radius_mm: float, propagation: str):
-        """拾取实体的全部边并倒角。返回 (fillet, strategy, edge_count, errors)。
+        """拾取实体的全部边并倒角。返回 (fillet, strategy, filleted, candidates, errors)。
 
         ── 为什么不是「把整个特征丢给 CATIA」──
         那条路已被实测否决（8 种组合全失败），而且失败方式讲清了原因：
@@ -575,7 +581,11 @@ class CatiaClient:
         不含任何硬编码拓扑名字。然后在第一条边上建圆角，其余边用
         `AddObjectToFillet` 追加进同一个特征 —— 特征树上就是干净的一个 EdgeFillet。
 
-        额外好处：边的条数本身就是证据。长方体应当正好是 12 条。
+        ── 候选数 ≠ 实体边数（实测）──
+        搜索是**全文档**范围的，40×30×20 的长方体实测捞到 16 个候选：12 条实体边
+        + 4 条草图线。草图线被 CATIA 拒绝（`AddObjectToFillet failed`）是**预期行为**，
+        不是故障。所以这里同时返回「候选数」与「实际倒角数」，让两者的差值有据可查，
+        而不是把预期内的拒绝伪装成错误。
         """
         # catTangencyFilletEdgePropagation = 1 / catMinimalFilletEdgePropagation = 2
         mode = 1 if propagation == "tangency" else 2
@@ -600,21 +610,33 @@ class CatiaClient:
             try:
                 fillet = method(refs[0], mode, radius_mm)
             except pythoncom.com_error as exc:  # type: ignore[attr-defined]
-                errors.append(f"{method_name}(第 1 条边): {exc}")
+                errors.append(f"{method_name}(候选 1/{len(refs)}): {exc}")
                 continue
 
             added = 1
-            for ref in refs[1:]:
+            rejected = 0
+            for idx, ref in enumerate(refs[1:], start=2):
                 try:
                     fillet.AddObjectToFillet(ref)
                     added += 1
-                except pythoncom.com_error as exc:  # type: ignore[attr-defined]
-                    # 单条边加不进去不致命：记下来，让体积证据去说明少倒了多少
-                    errors.append(f"AddObjectToFillet(第 {added + 1} 条边): {exc}")
-            return fillet, f"{query}/{method_name}/edges={added}", added, errors
+                except pythoncom.com_error:  # type: ignore[attr-defined]
+                    # 预期内：搜索是全文档范围的，会捞到草图线等不可倒角的对象。
+                    # 只计数、不当错误，避免把正常现象伪装成故障。
+                    rejected += 1
+            if rejected:
+                errors.append(
+                    f"{rejected}/{len(refs)} 个候选被 CATIA 拒绝（通常是草图线等非实体边，属预期内）"
+                )
+            return (
+                fillet,
+                f"{query}/{method_name}/edges={added}of{len(refs)}",
+                added,
+                len(refs),
+                errors,
+            )
 
         raise RuntimeError(
-            f"拾到了 {len(refs)} 条边，但 ShapeFactory 的倒圆角方法都调用失败。\n"
+            f"拾到了 {len(refs)} 个候选，但 ShapeFactory 的倒圆角方法都调用失败。\n"
             "各次尝试的原始报错：\n  " + "\n  ".join(str(e) for e in errors)
         )
 
