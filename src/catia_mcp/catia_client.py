@@ -225,6 +225,54 @@ class CatiaClient:
         )
 
     # ------------------------------------------------------------------
+    # 导出能力探针 —— 定位「ExportData failed」到底是许可证还是 STEP 单独没授权
+    # ------------------------------------------------------------------
+    def probe_export_formats(self, out_dir: str) -> dict:
+        """对当前活动 Part 逐个尝试多种导出格式，报告每种成功/失败。
+
+        决定性诊断：
+            - 若 stp/step/igs/stl 全失败 → translator/许可证整体缺失。
+            - 若仅 stp/step 失败、stl/igs 成功 → STEP 单独未授权。
+        返回 {fmt: {"ok": bool, "file": path|None, "error": msg|None}}。
+        """
+        app = self._require_app()
+        part_doc = app.ActiveDocument
+
+        os.makedirs(out_dir, exist_ok=True)
+        base = os.path.join(out_dir, "probe_export")
+
+        # (格式串, 文件扩展名)
+        trials = [
+            ("stp", ".stp"),
+            ("step", ".step"),
+            ("igs", ".igs"),
+            ("stl", ".stl"),
+            ("wrl", ".wrl"),
+            ("model", ".model"),
+            ("cgr", ".cgr"),
+        ]
+        results: dict = {}
+        for fmt, ext in trials:
+            target = f"{base}_{fmt}{ext}"
+            try:
+                if os.path.exists(target):
+                    os.remove(target)
+                part_doc.ExportData(target, fmt)
+                resolved = self._find_recent_step_file(target) if ext in (".stp", ".step") else (
+                    target if os.path.isfile(target) and os.path.getsize(target) > 0 else None
+                )
+                results[fmt] = {
+                    "ok": resolved is not None,
+                    "file": resolved,
+                    "error": None if resolved is not None else "调用未抛错但无非空文件（多半是缺许可证）",
+                }
+            except pythoncom.com_error as exc:  # type: ignore[attr-defined]
+                results[fmt] = {"ok": False, "file": None, "error": f"COM: {exc}"}
+            except OSError as exc:
+                results[fmt] = {"ok": False, "file": None, "error": f"OS: {exc}"}
+        return results
+
+    # ------------------------------------------------------------------
     # 安全保存 + STEP 导出回读（验证原则 5）
     # ------------------------------------------------------------------
     def export_step_and_verify(
