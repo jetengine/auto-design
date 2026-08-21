@@ -226,6 +226,54 @@ def add_pocket(
     return asdict(result)
 
 
+@mcp.tool()
+def add_fillet(
+    radius_mm: float,
+    box_length_mm: float | None = None,
+    box_width_mm: float | None = None,
+    box_height_mm: float | None = None,
+    propagation: str = "tangency",
+) -> dict:
+    """给当前活动 Part 的实体加恒定半径倒圆角（EdgeFillet），并用体积差验证。
+
+    这是第三种特征类型（修饰特征），也是第一次涉及**边/面拾取**。
+    实现刻意绕开逐条边的 BRep 引用（那种引用绑定具体拓扑、极易失效），
+    改为把整个特征/实体交给 CATIA 展开成它的全部边 —— 因此这是**整体倒角**，
+    不能挑单条边。
+
+    参数：
+        radius_mm:    圆角半径（毫米，>0，直径须小于最小边长，否则几何自相交）
+        box_*_mm:     可选但**强烈建议传**。给出被倒角长方体的长宽高后，
+                      系统能算出理论去料体积做硬验证；不传则只有弱验证。
+        propagation:  "tangency"（默认，沿相切面传播）或 "minimal"
+
+    返回（既是结果也是证据）：
+        fillet_name:            生成的圆角特征名
+        strategy:               实际生效的拾取策略（自证拾到的是什么）
+        update_ok:              特征树 Update 是否成功
+        volume_before/after_mm3: 倒角前后体积
+        measured_removed_mm3:   实测去料 = before − after
+        expected_removed_mm3:   理论去料（传了尺寸才有）
+        volume_match:           实测与理论是否吻合（容差 0.1% 内）
+        target_errors:          各失败拾取策略的原始报错（诊断用）
+
+    使用建议：先 create_box，再用同样的长宽高调本工具，
+    update_ok 与 volume_match 都为 true 才算倒角合格。
+    """
+
+    def _job(client: CatiaClient):
+        return client.add_fillet(
+            radius_mm=radius_mm,
+            box_length_mm=box_length_mm,
+            box_width_mm=box_width_mm,
+            box_height_mm=box_height_mm,
+            propagation=propagation,
+        )
+
+    result = _worker.call(_job, timeout=120.0, label="add_fillet")
+    return asdict(result)
+
+
 
 @mcp.tool()
 def export_step_and_verify(

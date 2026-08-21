@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import sys
 from dataclasses import dataclass
@@ -77,6 +78,31 @@ class PocketResult:
     strategy: str = ""                     # 实际生效的草图平面策略（见 _make_pocket_sketch）
     pocket_from: str = ""                  # "top"=从顶面向下挖；"bottom"=从底面向上挖（退化路径）
     plane_errors: Optional[list] = None    # 各失败策略的报错，定位环境差异用
+
+
+@dataclass
+class FilletResult:
+    """给实体加倒圆角（EdgeFillet）的结构化证据。
+
+    与 Pad/Pocket 的关键区别：倒圆角必须**指定拾取哪些边**，而 CATIA 的边引用是
+    出了名的脆（拓扑一变引用就失效）。所以这里记录 `strategy` / `target_errors`，
+    让「到底拾到了什么」这件事**可被证据回答**，而不是靠猜。
+    """
+
+    document_name: str
+    body_name: str
+    fillet_name: str
+    radius_mm: float
+    propagation: str                       # tangency / minimal
+    strategy: str                          # 实际生效的拾取策略（见 _add_fillet_on_first_target）
+    update_ok: bool
+    volume_before_mm3: Optional[float]
+    volume_after_mm3: Optional[float]
+    measured_removed_mm3: Optional[float]  # 实测去料 = before − after
+    expected_removed_mm3: Optional[float]  # 理论去料（只有传了长方体尺寸才算得出）
+    volume_match: Optional[bool]           # 实测与理论是否吻合
+    relative_error: Optional[float]
+    target_errors: Optional[list] = None   # 各失败拾取策略的原始 COM 报错
 
 
 
@@ -428,6 +454,187 @@ class CatiaClient:
             False,
             errors,
         )
+
+    # ------------------------------------------------------------------
+    # 写操作（修饰特征）—— 第一次涉及「边/面拾取」
+    # ------------------------------------------------------------------
+    def add_fillet(
+        self,
+        radius_mm: float,
+        box_length_mm: Optional[float] = None,
+        box_width_mm: Optional[float] = None,
+        box_height_mm: Optional[float] = None,
+        propagation: str = "tangency",
+        volume_tolerance: float = 1e-3,
+    ) -> FilletResult:
+        """给当前活动 Part 的实体加恒定半径倒圆角，并用体积差验证。
+
+        与 Pad / Pocket 的本质区别：
+            前两者只需要「平面 + 草图」，输入是**参数**；倒圆角必须先**拾取到边**，
+            输入是**几何引用**。CATIA 的边引用（BRep 名字如 `REdge:(Edge:(Face:(Brp:(Pad.1;2)...`）
+            绑定具体拓扑，改个尺寸就可能失效 —— 这是所有 CAD 自动化最经典的脆点。
+
+        本实现刻意**绕开逐条边的 BRep 名字**：改为把整个特征/实体作为拾取对象，
+        让 CATIA 自己展开成它的全部边。这样不写死任何拓扑名字，
+        代价是只能「整体倒角」，不能挑单条边（挑边留到确有需求时再按证据推进）。
+
+        参数：
+            radius_mm:      圆角半径（毫米，>0，且直径须小于最小边长）
+            box_*_mm:       可选。传入被倒角长方体的长宽高，就能算出**理论去料体积**做硬验证；
+                            不传则只报体积前后与实测去料量（弱验证）。
+            propagation:    "tangency"=沿相切面传播（默认）；"minimal"=最小传播
+            volume_tolerance: 体积相对误差容差，默认 0.1%
+
+        返回：既是结果也是证据，重点看 update_ok / volume_match / strategy。
+        """
+        if radius_mm <= 0:
+            raise ValueError("圆角半径必须为正数。")
+
+        dims = [box_length_mm, box_width_mm, box_height_mm]
+        if all(d is not None for d in dims):
+            min_dim = min(float(d) for d in dims)  # type: ignore[arg-type]
+            if 2 * float(radius_mm) >= min_dim:
+                raise ValueError(
+                    f"圆角直径 {2 * radius_mm} 必须小于最小边长 {min_dim}，否则几何自相交。"
+                )
+
+        app = self._require_app()
+        part_doc = app.ActiveDocument
+        part = part_doc.Part
+        body = part.Bodies.Item(1)
+
+        vol_before = self._measure_volume_mm3(part_doc, part, body)
+
+        part.InWorkObject = body
+        fillet, strategy, target_errors = self._add_fillet_on_first_target(
+            part, body, float(radius_mm), propagation
+        )
+
+        update_ok = True
+        try:
+            part.Update()
+        except pythoncom.com_error:  # type: ignore[attr-defined]
+            update_ok = False
+
+        vol_after = self._measure_volume_mm3(part_doc, part, body)
+        measured_removed: Optional[float] = None
+        if vol_before is not None and vol_after is not None:
+            measured_removed = vol_before - vol_after
+
+        expected_removed: Optional[float] = None
+        if all(d is not None for d in dims):
+            expected_removed = self._box_fillet_removed_mm3(
+                float(box_length_mm),  # type: ignore[arg-type]
+                float(box_width_mm),  # type: ignore[arg-type]
+                float(box_height_mm),  # type: ignore[arg-type]
+                float(radius_mm),
+            )
+
+        match: Optional[bool] = None
+        rel_err: Optional[float] = None
+        if measured_removed is not None and expected_removed:
+            rel_err = abs(measured_removed - expected_removed) / expected_removed
+            match = rel_err <= volume_tolerance
+
+        return FilletResult(
+            document_name=str(part_doc.Name),
+            body_name=str(body.Name),
+            fillet_name=str(fillet.Name),
+            radius_mm=float(radius_mm),
+            propagation=propagation,
+            strategy=strategy,
+            update_ok=update_ok,
+            volume_before_mm3=vol_before,
+            volume_after_mm3=vol_after,
+            measured_removed_mm3=measured_removed,
+            expected_removed_mm3=expected_removed,
+            volume_match=match,
+            relative_error=rel_err,
+            target_errors=target_errors or None,
+        )
+
+    def _add_fillet_on_first_target(
+        self, part, body, radius_mm: float, propagation: str
+    ):
+        """依次尝试「拾取对象 × 工厂方法」的组合，第一个不报错的胜出。
+
+        为什么要穷举：`ShapeFactory` 里倒圆角的方法名和可接受的拾取对象类型
+        在不同 CATIA 版本/配置下并不统一（`AddNewSolidEdgeFillet...` 与
+        `AddNewEdgeFillet...` 都存在），而失败只在调用瞬间以 COM 错误暴露。
+        与其猜，不如把候选组合跑一遍并**把每次失败原文记下来**。
+
+        返回 (fillet, strategy, errors)
+        """
+        # catTangencyFilletEdgePropagation = 1 / catMinimalFilletEdgePropagation = 2
+        mode = 1 if propagation == "tangency" else 2
+        shape_factory = part.ShapeFactory
+        errors: list = []
+
+        targets: list[tuple[str, object]] = []
+        # 候选 1：实体里最后一个特征（通常就是 Pad/Pocket）——倒它的全部边
+        try:
+            shapes = body.Shapes
+            count = int(shapes.Count)
+            if count > 0:
+                last = shapes.Item(count)
+                targets.append((f"last_shape({last.Name})", last))
+        except pythoncom.com_error as exc:  # type: ignore[attr-defined]
+            errors.append(f"取 last_shape 失败: {exc}")
+        # 候选 2：整个 Body——倒实体的全部边
+        targets.append(("body", body))
+
+        methods = (
+            "AddNewSolidEdgeFilletWithConstantRadius",
+            "AddNewEdgeFilletWithConstantRadius",
+        )
+
+        for target_name, target_obj in targets:
+            for as_ref in (True, False):
+                try:
+                    picked = (
+                        part.CreateReferenceFromObject(target_obj)
+                        if as_ref
+                        else target_obj
+                    )
+                except pythoncom.com_error as exc:  # type: ignore[attr-defined]
+                    errors.append(f"{target_name}/ref={as_ref}: 造引用失败 {exc}")
+                    continue
+                for method_name in methods:
+                    method = getattr(shape_factory, method_name, None)
+                    if method is None:
+                        continue
+                    try:
+                        fillet = method(picked, mode, radius_mm)
+                        return (
+                            fillet,
+                            f"{target_name}/ref={as_ref}/{method_name}",
+                            errors,
+                        )
+                    except pythoncom.com_error as exc:  # type: ignore[attr-defined]
+                        errors.append(f"{target_name}/ref={as_ref}/{method_name}: {exc}")
+
+        raise RuntimeError(
+            "所有倒圆角拾取策略都失败了。这通常意味着这台 CATIA 不接受"
+            "「整体特征/实体」作为倒角对象，需要改为逐条边的 BRep 引用。\n"
+            "各次尝试的原始报错：\n  " + "\n  ".join(str(e) for e in errors)
+        )
+
+    @staticmethod
+    def _box_fillet_removed_mm3(
+        length: float, width: float, height: float, r: float
+    ) -> float:
+        """长方体 12 条边全部倒 r 圆角后，被切掉的体积（精确解）。
+
+        把倒圆后的实体拆成互不重叠的四部分来算，而不是去减那些形状怪异的角料：
+            内芯长方体 + 6 块面板 + 12 段四分之一圆柱 + 8 个球面八分之一（合成一整球）
+        这样每一项都是初等体积，结果是精确值而非近似 —— 验证才立得住。
+        """
+        a, b, c = length - 2 * r, width - 2 * r, height - 2 * r
+        core = a * b * c
+        slabs = 2 * r * (a * b + a * c + b * c)
+        quarter_cylinders = math.pi * r * r * (a + b + c)
+        corners = 4.0 / 3.0 * math.pi * r ** 3
+        return length * width * height - (core + slabs + quarter_cylinders + corners)
 
     # ------------------------------------------------------------------
     # 导出能力探针 —— 定位「ExportData failed」到底是许可证还是 STEP 单独没授权
