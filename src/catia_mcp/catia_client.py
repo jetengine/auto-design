@@ -1068,22 +1068,7 @@ class CatiaClient:
 
         vol_before = self._measure_volume_mm3(part_doc, part, body)
 
-        part.InWorkObject = body
-        chamfer, strategy, added, candidates, errors = self._add_chamfer_on_edges(
-            part_doc, part, float(length_mm), float(angle_deg), propagation
-        )
-
-        update_ok = True
-        try:
-            part.Update()
-        except pythoncom.com_error:  # type: ignore[attr-defined]
-            update_ok = False
-
-        vol_after = self._measure_volume_mm3(part_doc, part, body)
-        measured_removed: Optional[float] = None
-        if vol_before is not None and vol_after is not None:
-            measured_removed = vol_before - vol_after
-
+        # 理论去料先算 —— 它不只是「事后复核」，下面的策略链要拿它当判据。
         expected_removed: Optional[float] = None
         if all(d is not None for d in dims) and abs(angle_deg - 45.0) < 1e-9:
             expected_removed = self._box_chamfer_removed_mm3(
@@ -1093,11 +1078,63 @@ class CatiaClient:
                 float(length_mm),
             )
 
-        match: Optional[bool] = None
-        rel_err: Optional[float] = None
-        if measured_removed is not None and expected_removed:
-            rel_err = abs(measured_removed - expected_removed) / expected_removed
-            match = rel_err <= volume_tolerance
+        part.InWorkObject = body
+        # catTangencyChamfer = 1 / catMinimalChamfer = 2
+        prop = 1 if propagation == "tangency" else 2
+        errors: list = []
+        chosen = None
+
+        for cand in self._chamfer_candidates(part.ShapeFactory, errors):
+            built = self._try_build_chamfer(
+                part_doc, part, cand, float(length_mm), float(angle_deg), prop, errors
+            )
+            if built is None:
+                continue
+            chamfer, strategy, added, candidate_count = built
+
+            update_ok = True
+            try:
+                part.Update()
+            except pythoncom.com_error:  # type: ignore[attr-defined]
+                update_ok = False
+
+            vol_after = self._measure_volume_mm3(part_doc, part, body)
+            removed: Optional[float] = None
+            if vol_before is not None and vol_after is not None:
+                removed = vol_before - vol_after
+
+            match: Optional[bool] = None
+            rel_err: Optional[float] = None
+            if removed is not None and expected_removed:
+                rel_err = abs(removed - expected_removed) / expected_removed
+                match = rel_err <= volume_tolerance
+
+            if expected_removed is None or (update_ok and match):
+                chosen = (
+                    chamfer, strategy, added, candidate_count,
+                    update_ok, vol_after, removed, match, rel_err,
+                )
+                break
+
+            # 调用被接受了，但做出来的不是想要的东西 —— 撤销，换下一个组合。
+            # 这一步是整条链的关键：**枚举猜错在这里被体积当场抓住**，
+            # 而不是留一个"没报错但形状不对"的特征混过去。
+            errors.append(
+                f"{strategy}: update_ok={update_ok}，去料 {removed} 与理论 "
+                f"{expected_removed} 不符，已撤销该特征"
+            )
+            self._delete_feature(part_doc, part, chamfer)
+
+        if chosen is None:
+            raise RuntimeError(
+                "倒斜角的所有方法/参数个数/枚举组合都没能做出正确结果。\n"
+                "各次尝试：\n  " + "\n  ".join(str(e) for e in errors)
+            )
+
+        (
+            chamfer, strategy, added, candidate_count,
+            update_ok, vol_after, measured_removed, match, rel_err,
+        ) = chosen
 
         return ChamferResult(
             document_name=str(part_doc.Name),
@@ -1115,7 +1152,7 @@ class CatiaClient:
             volume_match=match,
             relative_error=rel_err,
             objects_chamfered=added,
-            edge_candidates=candidates,
+            edge_candidates=candidate_count,
             target_errors=errors or None,
         )
 
@@ -1275,7 +1312,7 @@ class CatiaClient:
 
         part.InWorkObject = body
         draft, strategy, draft_errors = self._add_draft_on_faces(
-            part, [f["ref"] for f in sides], bottom["ref"], float(angle_deg)
+            part_doc, part, [f["ref"] for f in sides], bottom["ref"], float(angle_deg)
         )
         errors.extend(draft_errors)
 
@@ -1675,71 +1712,110 @@ class CatiaClient:
     # ------------------------------------------------------------------
     # 修饰特征三兄弟的底层实现
     # ------------------------------------------------------------------
-    def _add_chamfer_on_edges(
-        self, part_doc, part, length_mm: float, angle_deg: float, propagation: str
-    ):
-        """拾取实体全部边并倒斜角。返回 (chamfer, strategy, added, candidates, errors)。
+    @staticmethod
+    def _chamfer_candidates(shape_factory, errors: list) -> list:
+        """列出要试的 (方法名, 参数个数, mode, orientation, 第二个尺寸参数的含义)。
 
-        边拾取完全复用 Fillet 那条已验证的路（`_search_edge_references`），
-        这里只处理斜角特有的一件事：**枚举值不确定**。
+        ── 首轮真机实测告诉我们两件事 ──
+        1. 这台 V5R34 上**没有** `AddNewSolidEdgeChamfer`（getattr 直接是 None）。
+        2. `AddNewChamfer` 收 5 个参数时报 **"Invalid number of parameters."**
+           —— 说明真实签名比我押的多一个，多出来的是 `CatChamferOrientation`：
+           `AddNewChamfer(边, 传播, 模式, 朝向, 长度1, 角度或长度2)`。
 
-        `CatChamferMode` 里「长度 + 角度」这一档，各处资料写作 0 / 1 / 2 的都有，
-        而且不同 R 版还可能不同。与其押一个值然后在别的机器上炸掉，不如按序试，
-        并把**实际生效的值写进 strategy** —— 第一次在真机上跑完，这个值就被钉死了，
-        以后出问题也能一眼看出是不是它变了。
+        ── 于是这里要同时枚举三个不确定量 ──
+        参数个数（6 / 5）、`CatChamferMode`（1/2/0）、以及**第二个尺寸参数到底是
+        角度还是第二条边长** —— 后者才是最阴的：模式枚举猜反时，把 45 当成 45mm
+        的边长，调用照样合法，只是做出来的东西完全不对。
+
+        所以候选里成对地放「角度」和「第二边长」两种解释，让上层用体积去裁决。
+        对 45° 斜角这两种解释的正确结果**恰好是同一个形状**（两条腿都等于 d），
+        所以谁对谁错只能靠算出来的体积分辨，靠读文档分辨不了。
+
+        朝向（orientation）对 45° 对称斜角不影响体积，所以排在最后当兜底。
         """
-        # catTangencyChamfer = 1 / catMinimalChamfer = 2
-        prop = 1 if propagation == "tangency" else 2
-        shape_factory = part.ShapeFactory
-        errors: list = []
+        names = []
+        for name in ("AddNewChamfer", "AddNewSolidEdgeChamfer"):
+            if getattr(shape_factory, name, None) is not None:
+                names.append(name)
+            else:
+                errors.append(f"{name}: 这台机器的 ShapeFactory 上不存在，跳过")
+        if not names:
+            return []
+
+        cands = []
+        for name in names:
+            for orient in (1, 2):
+                for mode in (1, 2, 0):
+                    for kind in ("angle", "length2"):
+                        cands.append((name, 6, mode, orient, kind))
+            for mode in (1, 2, 0):
+                for kind in ("angle", "length2"):
+                    cands.append((name, 5, mode, 0, kind))
+        return cands
+
+    def _try_build_chamfer(self, part_doc, part, cand, length_mm, angle_deg, prop, errors):
+        """按一组候选参数建一次斜角。成功返回 (chamfer, strategy, added, candidates)。
+
+        每次都重新搜一遍边：上一轮失败的特征被删掉之后，BRep 名字可能已经变了，
+        沿用旧引用是自找麻烦 —— 重搜很便宜，别省这一下。
+        """
+        name, arity, mode, orient, kind = cand
+        method = getattr(part.ShapeFactory, name, None)
+        if method is None:
+            return None
 
         refs, query = self._search_edge_references(part_doc, errors)
         if not refs:
-            raise RuntimeError(
-                "没能拾取到任何边，倒斜角无法进行。\n"
-                "各次尝试的原始报错：\n  " + "\n  ".join(str(e) for e in errors)
-            )
+            return None
 
-        attempts = [
-            (name, mode)
-            for name in ("AddNewSolidEdgeChamfer", "AddNewChamfer")
-            for mode in (1, 2, 0)
-        ]
-        for method_name, mode in attempts:
-            method = getattr(shape_factory, method_name, None)
-            if method is None:
-                continue
-            try:
-                chamfer = method(refs[0], prop, mode, length_mm, angle_deg)
-            except pythoncom.com_error as exc:  # type: ignore[attr-defined]
-                errors.append(f"{method_name}(mode={mode}): {exc}")
-                continue
-
-            added = 1
-            rejected = 0
-            for ref in refs[1:]:
-                try:
-                    chamfer.AddObjectToChamfer(ref)
-                    added += 1
-                except pythoncom.com_error:  # type: ignore[attr-defined]
-                    # 与 Fillet 同理：搜索是全文档范围的，会捞到草图线等非实体边。
-                    rejected += 1
-            if rejected:
-                errors.append(
-                    f"{rejected}/{len(refs)} 个候选被 CATIA 拒绝（通常是草图线等非实体边，属预期内）"
-                )
-            return (
-                chamfer,
-                f"{query}/{method_name}(mode={mode})/edges={added}of{len(refs)}",
-                added,
-                len(refs),
-                errors,
-            )
-
-        raise RuntimeError(
-            f"拾到了 {len(refs)} 个候选，但 ShapeFactory 的倒斜角方法/枚举组合都失败了。\n"
-            "各次尝试的原始报错：\n  " + "\n  ".join(str(e) for e in errors)
+        second = angle_deg if kind == "angle" else length_mm * math.tan(math.radians(angle_deg))
+        args = (
+            (refs[0], prop, mode, orient, length_mm, second)
+            if arity == 6
+            else (refs[0], prop, mode, length_mm, second)
         )
+        tag = f"{name}(argc={arity},mode={mode},orient={orient},2nd={kind})"
+        try:
+            chamfer = method(*args)
+        except pythoncom.com_error as exc:  # type: ignore[attr-defined]
+            errors.append(f"{tag}: {exc}")
+            return None
+
+        added = 1
+        rejected = 0
+        for ref in refs[1:]:
+            try:
+                chamfer.AddObjectToChamfer(ref)
+                added += 1
+            except pythoncom.com_error:  # type: ignore[attr-defined]
+                # 与 Fillet 同理：搜索是全文档范围的，会捞到草图线等非实体边。
+                rejected += 1
+        if rejected:
+            errors.append(
+                f"{tag}: {rejected}/{len(refs)} 个候选被拒（通常是草图线等非实体边，属预期内）"
+            )
+        return chamfer, f"{query}/{tag}/edges={added}of{len(refs)}", added, len(refs)
+
+    @staticmethod
+    def _delete_feature(part_doc, part, feature) -> bool:
+        """把一个刚建错的特征从树上删掉，让下一次尝试从干净状态开始。
+
+        没有这一步，策略链就只能「试一次」——第一个被接受但做错的组合会永久
+        赖在树上，后面所有尝试都建在一个已经错了的模型上。
+        """
+        try:
+            selection = part_doc.Selection
+            selection.Clear()
+            selection.Add(feature)
+            selection.Delete()
+            selection.Clear()
+        except pythoncom.com_error:  # type: ignore[attr-defined]
+            return False
+        try:
+            part.Update()
+        except pythoncom.com_error:  # type: ignore[attr-defined]
+            pass
+        return True
 
     def _face_table(self, part_doc, app, errors: list):
         """把实体的每个面连同面积、重心列成表。返回 (table, 生效的查询串)。
@@ -1834,45 +1910,74 @@ class CatiaClient:
         )
 
     @staticmethod
-    def _add_draft_on_faces(part, side_refs: list, neutral_ref, angle_deg: float):
+    def _make_references(part, refs: list, errors: list):
+        """尽力造出一个 `References` 集合。返回 (集合或 None, 走通的路子)。
+
+        首轮真机实测：这台 V5R34 的 `Part` 上**根本没有** `CreateReferences`
+        （`getattr` 直接是 None）。而 `AddNewDraft` 的第一个参数偏偏要它。
+
+        所以这里把「集合从哪来」当成一个未知量按序试，而不是押一个写法。
+        全试不出来也不算死路 —— 上层还有「逐面各建一个 Draft」的退化路径。
+        """
+        routes = (
+            ("part.CreateReferences()", lambda: part.CreateReferences()),
+            ("part.Application.CreateReferences()",
+             lambda: part.Application.CreateReferences()),
+            ("part.Parent.CreateReferences()", lambda: part.Parent.CreateReferences()),
+        )
+        for label, make in routes:
+            try:
+                col = make()
+            except (AttributeError, pythoncom.com_error) as exc:  # type: ignore[attr-defined]
+                errors.append(f"{label}: {exc}")
+                continue
+            if col is None:
+                errors.append(f"{label}: 返回 None")
+                continue
+            try:
+                for ref in refs:
+                    col.Add(ref)
+            except (AttributeError, pythoncom.com_error) as exc:  # type: ignore[attr-defined]
+                errors.append(f"{label} 之后 .Add 失败: {exc}")
+                continue
+            return col, label
+        return None, ""
+
+    def _add_draft_on_faces(self, part_doc, part, side_refs: list, neutral_ref, angle_deg: float):
         """给一组侧面加拔模。返回 (draft, strategy, errors)。
 
-        ── 这里第一次要用到 References 集合 ──
-        `AddNewDraft` 收的不是单个 Reference，而是一个 `References` 集合对象
-        （`part.CreateReferences()` 造出来再逐个 Add）。这是本项目第一次碰它，
-        所以万一这台机器上不存在，报错要说清是哪一步没过，而不是甩个 AttributeError。
+        ── 两条路，先走整的，走不通就走碎的 ──
+        `AddNewDraft` 的第一个参数要 `References` 集合。首轮实测这台机器造不出来，
+        所以准备了退化路径：**一个面建一个 Draft 特征**。
 
-        ── 两个枚举同样按序试 ──
+        退化路径为什么在几何上等价：四个侧面用的是同一个中性面、同一个方向、
+        同一个角度，分四次做和一次做出来的形状一样，只是特征树上多三个节点。
+        **能接受的降级要说清代价** —— 这里的代价就是树变长了，仅此而已。
+
+        ── 枚举照旧按序试 ──
         中性面传播模式和拔模模式的取值资料不一，做法与斜角一致：按序试、
-        把生效的写进 strategy、用体积把结果钉死。
+        把生效的写进 strategy、最后用体积把结果钉死。
         """
         shape_factory = part.ShapeFactory
         errors: list = []
 
-        maker = getattr(part, "CreateReferences", None)
-        if maker is None:
+        method = getattr(shape_factory, "AddNewDraft", None)
+        if method is None:
             raise RuntimeError(
-                "这台机器上的 Part 对象没有 CreateReferences —— 无法构造 References 集合，"
-                "拔模拿不到入参。请把这条报错原样贴回来，据此换别的构造方式。"
+                "这台机器的 ShapeFactory 上没有 AddNewDraft。"
+                "请跑 `python scripts\\probe_draft_api.py`，它会列出真实存在的方法名和参数表。"
             )
-        try:
-            refs_col = maker()
-            for ref in side_refs:
-                refs_col.Add(ref)
-        except pythoncom.com_error as exc:  # type: ignore[attr-defined]
-            raise RuntimeError(f"构造 References 集合失败：{exc}") from exc
 
         try:
             direction = part.CreateReferenceFromObject(part.OriginElements.PlaneXY)
-        except pythoncom.com_error as exc:  # type: ignore[attr-defined]
+        except (AttributeError, pythoncom.com_error) as exc:  # type: ignore[attr-defined]
             raise RuntimeError(f"取不到拔模方向（PlaneXY 的引用）：{exc}") from exc
 
-        method = getattr(shape_factory, "AddNewDraft", None)
-        if method is None:
-            raise RuntimeError("ShapeFactory 上没有 AddNewDraft。")
+        combos = [(n, m) for n in (1, 2, 0) for m in (0, 1)]
+        refs_col, route = self._make_references(part, side_refs, errors)
 
-        for neutral_mode in (1, 2, 0):
-            for draft_mode in (0, 1):
+        if refs_col is not None:
+            for neutral_mode, draft_mode in combos:
                 try:
                     draft = method(
                         refs_col, neutral_ref, neutral_mode,
@@ -1880,17 +1985,45 @@ class CatiaClient:
                     )
                 except pythoncom.com_error as exc:  # type: ignore[attr-defined]
                     errors.append(
-                        f"AddNewDraft(neutral={neutral_mode},mode={draft_mode}): {exc}"
+                        f"AddNewDraft({route}, neutral={neutral_mode}, mode={draft_mode}): {exc}"
                     )
                     continue
                 return (
                     draft,
-                    f"AddNewDraft(neutral={neutral_mode},mode={draft_mode})",
+                    f"AddNewDraft({route},neutral={neutral_mode},mode={draft_mode})",
                     errors,
                 )
 
+        # 退化路径：一个面一个 Draft
+        for neutral_mode, draft_mode in combos:
+            made: list = []
+            failure = None
+            for i, ref in enumerate(side_refs):
+                try:
+                    made.append(
+                        method(ref, neutral_ref, neutral_mode,
+                               direction, float(angle_deg), draft_mode)
+                    )
+                except pythoncom.com_error as exc:  # type: ignore[attr-defined]
+                    failure = (
+                        f"AddNewDraft(逐面 {i + 1}/{len(side_refs)}, "
+                        f"neutral={neutral_mode}, mode={draft_mode}): {exc}"
+                    )
+                    break
+            if failure is None and made:
+                return (
+                    made[-1],
+                    f"AddNewDraft(逐面×{len(made)},neutral={neutral_mode},mode={draft_mode})",
+                    errors,
+                )
+            errors.append(failure or "逐面路径没建出任何特征")
+            # 半途失败要把已经建出来的清掉，否则下一轮尝试是在脏模型上做的
+            for feature in reversed(made):
+                self._delete_feature(part_doc, part, feature)
+
         raise RuntimeError(
-            "AddNewDraft 的所有枚举组合都失败了。\n"
+            "AddNewDraft 的所有路子（References 集合 / 逐面）和枚举组合都失败了。\n"
+            "请跑 `python scripts\\probe_draft_api.py` 看真实签名。\n"
             "各次尝试的原始报错：\n  " + "\n  ".join(str(e) for e in errors)
         )
 
@@ -1934,6 +2067,69 @@ class CatiaClient:
         k = height * math.tan(math.radians(angle_deg))
         sign = 1.0 if outward else -1.0
         return height * (sign * k * (length + width) + 4.0 * k * k / 3.0)
+
+    # ------------------------------------------------------------------
+    # API 探针 —— 不再靠猜签名，直接问类型库
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _com_signatures(obj, keywords: tuple = ()) -> list:
+        """把 COM 对象上**真实存在**的方法连同参数名列出来。
+
+        这比「按名字 getattr 试探」强一个量级：
+            试探只能回答"我猜的这个在不在"；
+            类型信息能回答"到底有哪些、每个要几个参数、参数叫什么"。
+
+        首轮真机踩的两个坑（`AddNewSolidEdgeChamfer` 不存在、`AddNewChamfer`
+        参数个数不对、`Part.CreateReferences` 不存在）本质上是同一个问题：
+        **拿二手文档当一手事实**。类型库就在那台机器上，问它就好了。
+        """
+        try:
+            type_info = obj._oleobj_.GetTypeInfo()
+            attr = type_info.GetTypeAttr()
+        except Exception as exc:  # noqa: BLE001 —— 拿不到类型信息不该让探针整个挂掉
+            return [f"<取不到类型信息：{exc}>"]
+
+        out: list = []
+        for i in range(attr.cFuncs):
+            try:
+                desc = type_info.GetFuncDesc(i)
+                names = type_info.GetNames(desc.memid)
+            except Exception:  # noqa: BLE001
+                continue
+            if not names:
+                continue
+            method, params = str(names[0]), [str(n) for n in names[1:]]
+            if keywords and not any(k.lower() in method.lower() for k in keywords):
+                continue
+            out.append(f"{method}({', '.join(params)})")
+        return sorted(set(out))
+
+    def probe_shape_api(self) -> dict:
+        """列出当前 Part 上与修饰特征相关的真实 API 签名。
+
+        用法：先随便建个 Part（或打开一个），再跑 `scripts\\probe_draft_api.py`。
+        这是个**诊断工具**，没有固定合格标准，所以不进回归 —— 和 probe_export_formats 同理。
+        """
+        app = self._require_app()
+        part_doc = app.ActiveDocument
+        part = part_doc.Part
+        shape_factory = part.ShapeFactory
+
+        report: dict = {
+            "document_name": str(part_doc.Name),
+            "shapefactory_chamfer": self._com_signatures(shape_factory, ("chamfer",)),
+            "shapefactory_draft": self._com_signatures(shape_factory, ("draft",)),
+            "shapefactory_shell": self._com_signatures(shape_factory, ("shell",)),
+            "part_create_methods": self._com_signatures(part, ("create",)),
+        }
+
+        # References 集合到底能不能造出来 —— 直接试一遍，把每条路的结果都记下来
+        errors: list = []
+        col, route = self._make_references(part, [], errors)
+        report["references_route"] = route or None
+        report["references_errors"] = errors or None
+        report["references_type"] = type(col).__name__ if col is not None else None
+        return report
 
     # ------------------------------------------------------------------
     # 导出能力探针 —— 定位「ExportData failed」到底是许可证还是 STEP 单独没授权
