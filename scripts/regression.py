@@ -56,6 +56,7 @@ STEPS: tuple[Step, ...] = (
     Step("box", "create_box_smoke.py", 180.0, False, "加料特征（Sketch + Pad）"),
     Step("pocket", "add_pocket_smoke.py", 180.0, False, "去料特征（偏移平面 + Pocket）"),
     Step("fillet", "add_fillet_smoke.py", 180.0, False, "几何引用（边拾取 + EdgeFillet）"),
+    Step("shapes", "shape_features_smoke.py", 300.0, False, "修饰特征（斜角 / 抽壳 / 拔模）"),
     Step("measure", "measure_smoke.py", 180.0, False, "只读测量（体积/面积/重心 三独立证据）"),
     Step("family", "family_smoke.py", 300.0, False, "批量建族（规模化 + 单个失败不拖垮整批）"),
     Step("export", "export_step_smoke.py", 240.0, False, "交付（STEP，不可用则降级 IGES）"),

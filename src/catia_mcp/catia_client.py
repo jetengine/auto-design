@@ -108,6 +108,92 @@ class FilletResult:
     target_errors: Optional[list] = None   # 各失败拾取策略的原始 COM 报错
 
 
+@dataclass
+class ChamferResult:
+    """倒斜角（Chamfer）的结构化证据 —— 与 Fillet 同一条拾取路径，换个刀。"""
+
+    document_name: str
+    body_name: str
+    chamfer_name: str
+    length_mm: float
+    angle_deg: float
+    propagation: str
+    strategy: str                          # 含实际生效的 mode 枚举值（枚举靠实测钉，不靠猜）
+    update_ok: bool
+    volume_before_mm3: Optional[float]
+    volume_after_mm3: Optional[float]
+    measured_removed_mm3: Optional[float]
+    expected_removed_mm3: Optional[float]  # 只有 45° + 给了长方体尺寸才算得出精确解
+    volume_match: Optional[bool]
+    relative_error: Optional[float]
+    objects_chamfered: Optional[int] = None
+    edge_candidates: Optional[int] = None
+    target_errors: Optional[list] = None
+
+
+@dataclass
+class FaceInfo:
+    """一个面的可测量身份证 —— 挑面靠它，不靠索引。"""
+
+    index: int                             # 在搜索结果里的序号（仅供追溯，**不作为身份**）
+    area_mm2: Optional[float]
+    cog_mm: Optional[tuple]
+
+
+@dataclass
+class ShellResult:
+    """抽壳（Shell）的结构化证据。
+
+    这是第一个**必须指名道姓拾取某一个面**的特征：倒角可以「全都要」，
+    抽壳必须回答「去掉哪个面」。所以这里额外记录被选中面的面积与重心，
+    让「它到底选中了哪个面」可被证据回答。
+    """
+
+    document_name: str
+    body_name: str
+    shell_name: str
+    thickness_mm: float
+    removed_face: Optional[FaceInfo]       # 被去掉的那个面（自证选对了没有）
+    face_candidates: int
+    strategy: str
+    update_ok: bool
+    volume_before_mm3: Optional[float]
+    volume_after_mm3: Optional[float]
+    measured_removed_mm3: Optional[float]
+    expected_removed_mm3: Optional[float]
+    volume_match: Optional[bool]
+    relative_error: Optional[float]
+    target_errors: Optional[list] = None
+
+
+@dataclass
+class DraftResult:
+    """拔模（Draft）的结构化证据。
+
+    比抽壳更进一步：要同时指定**一组面**（被拔模的侧面）、**一个中性面**
+    （拔模时保持不变的基准）和**一个拔模方向**。三者错一个，结果就不是想要的。
+    """
+
+    document_name: str
+    body_name: str
+    draft_name: str
+    angle_deg: float
+    faces_drafted: int
+    neutral_face: Optional[FaceInfo]       # 中性面（应是底面）
+    face_candidates: int
+    strategy: str
+    update_ok: bool
+    volume_before_mm3: Optional[float]
+    volume_after_mm3: Optional[float]
+    measured_delta_mm3: Optional[float]    # after − before，**带符号**（拔模可能加料也可能去料）
+    expected_outward_mm3: Optional[float]  # 上大下小（加料）时的理论增量
+    expected_inward_mm3: Optional[float]   # 上小下大（去料）时的理论增量（负值）
+    matched_direction: Optional[str] = None  # "outward" / "inward" —— 实测符合哪一个
+    volume_match: Optional[bool] = None
+    relative_error: Optional[float] = None
+    target_errors: Optional[list] = None
+
+
 
 @dataclass
 class ExportResult:
@@ -916,6 +1002,349 @@ class CatiaClient:
         )
 
     # ------------------------------------------------------------------
+    # 修饰特征三兄弟：Chamfer / Shell / Draft
+    #
+    # 这三个是「抄作业」——最难的一关（怎么拿到合法的几何引用）已经在 Fillet
+    # 里趟平了。但抄作业也分三档，难度是递增的，而且每一档新增的东西都不一样：
+    #
+    #   Chamfer  与 Fillet 同一条边拾取路径，只是换了个 ShapeFactory 方法。
+    #            **唯一的新问题是枚举值**（CatChamferMode 的取值各处说法不一）。
+    #   Shell    第一次必须「指名道姓挑某一个面」——倒角可以全都要，抽壳不行。
+    #            新增的是**挑面的判据**。
+    #   Draft    要同时给一组面、一个中性面、一个方向。新增的是**多引用协同**。
+    #
+    # 三者都沿用同一条纪律：不确定的地方用策略链试，把实际生效的写进 strategy，
+    # 再用精确解体积把结果钉死 —— 猜错枚举不会静默通过，因为体积会对不上。
+    # ------------------------------------------------------------------
+    def add_chamfer(
+        self,
+        length_mm: float,
+        angle_deg: float = 45.0,
+        box_length_mm: Optional[float] = None,
+        box_width_mm: Optional[float] = None,
+        box_height_mm: Optional[float] = None,
+        propagation: str = "tangency",
+        volume_tolerance: float = 1e-3,
+    ) -> ChamferResult:
+        """给当前活动 Part 的实体全部边倒斜角，并用体积差验证。
+
+        ── 为什么它比 Fillet 便宜得多 ──
+        边拾取那一关（BRep 引用极脆、手写必失效）已经在 `_search_edge_references`
+        里解决了，这里直接复用。剩下的唯一新问题是 **CatChamferMode 的枚举值**：
+        「长度+角度」模式在不同资料里被写成 0 / 1 / 2 都有。
+
+        ── 枚举猜错会不会静默通过 ──
+        不会。如果误用成「两个长度」模式，第二个参数 45 会被当成 45mm 的第二条边长，
+        在 40×30×20 的体上直接吃穿 —— 要么 CATIA 报错，要么体积对不上。
+        **精确解验证在这里的作用不是"锦上添花"，而是枚举的判据本身。**
+
+        参数：
+            length_mm:  斜角第一条边长（毫米，>0）
+            angle_deg:  斜角角度（默认 45°）。**只有 45° 有精确解**，其余角度
+                        的八个角块是不规则多面体，暂不做硬验证（宁可不验，
+                        也不用近似值假装验过了）。
+            box_*_mm:   可选。给了才算得出理论去料体积。
+            propagation: "tangency"（默认）/ "minimal"
+        """
+        if length_mm <= 0:
+            raise ValueError("斜角边长必须为正数。")
+        if not 0 < angle_deg < 90:
+            raise ValueError(f"斜角角度必须在 (0, 90) 之间，收到 {angle_deg}。")
+
+        dims = [box_length_mm, box_width_mm, box_height_mm]
+        leg2 = float(length_mm) * math.tan(math.radians(angle_deg))
+        if all(d is not None for d in dims):
+            min_dim = min(float(d) for d in dims)  # type: ignore[arg-type]
+            if 2 * max(float(length_mm), leg2) >= min_dim:
+                raise ValueError(
+                    f"斜角尺寸过大 —— 两条边长 {length_mm:.3f} / {leg2:.3f} 中较大者的 2 倍"
+                    f"必须小于最短边 {min_dim}，否则几何自相交。"
+                )
+
+        app = self._require_app()
+        part_doc = app.ActiveDocument
+        part = part_doc.Part
+        body = part.Bodies.Item(1)
+
+        vol_before = self._measure_volume_mm3(part_doc, part, body)
+
+        part.InWorkObject = body
+        chamfer, strategy, added, candidates, errors = self._add_chamfer_on_edges(
+            part_doc, part, float(length_mm), float(angle_deg), propagation
+        )
+
+        update_ok = True
+        try:
+            part.Update()
+        except pythoncom.com_error:  # type: ignore[attr-defined]
+            update_ok = False
+
+        vol_after = self._measure_volume_mm3(part_doc, part, body)
+        measured_removed: Optional[float] = None
+        if vol_before is not None and vol_after is not None:
+            measured_removed = vol_before - vol_after
+
+        expected_removed: Optional[float] = None
+        if all(d is not None for d in dims) and abs(angle_deg - 45.0) < 1e-9:
+            expected_removed = self._box_chamfer_removed_mm3(
+                float(box_length_mm),  # type: ignore[arg-type]
+                float(box_width_mm),   # type: ignore[arg-type]
+                float(box_height_mm),  # type: ignore[arg-type]
+                float(length_mm),
+            )
+
+        match: Optional[bool] = None
+        rel_err: Optional[float] = None
+        if measured_removed is not None and expected_removed:
+            rel_err = abs(measured_removed - expected_removed) / expected_removed
+            match = rel_err <= volume_tolerance
+
+        return ChamferResult(
+            document_name=str(part_doc.Name),
+            body_name=str(body.Name),
+            chamfer_name=str(chamfer.Name),
+            length_mm=float(length_mm),
+            angle_deg=float(angle_deg),
+            propagation=propagation,
+            strategy=strategy,
+            update_ok=update_ok,
+            volume_before_mm3=vol_before,
+            volume_after_mm3=vol_after,
+            measured_removed_mm3=measured_removed,
+            expected_removed_mm3=expected_removed,
+            volume_match=match,
+            relative_error=rel_err,
+            objects_chamfered=added,
+            edge_candidates=candidates,
+            target_errors=errors or None,
+        )
+
+    def add_shell(
+        self,
+        thickness_mm: float,
+        box_length_mm: Optional[float] = None,
+        box_width_mm: Optional[float] = None,
+        box_height_mm: Optional[float] = None,
+        volume_tolerance: float = 1e-3,
+    ) -> ShellResult:
+        """把当前活动 Part 的实体抽成薄壳（去掉顶面开口），并用体积差验证。
+
+        ── 这一步真正新增的东西：挑面的判据 ──
+        倒角可以「把搜到的边全都要」，抽壳不行 —— 必须回答「去掉哪一个面」。
+        而 `Selection.Search` 回来的顺序**不保证**：换个模型、换个 CATIA 版本，
+        第 3 个面就可能不再是顶面。所以这里**不按索引挑面，按测量挑面**：
+        逐个面读出重心，取重心 Z 最大的那个 —— 这条判据换任何模型都成立。
+
+        代价是每个面要多一次 COM 往返（重心还得走 VBA 蹦床）。六个面而已，值。
+
+        ── 自证 ──
+        返回里带上被选中面的**面积和重心**。如果哪天它挑错了面，
+        看一眼 `removed_face` 就知道，不用去 CATIA 里肉眼找。
+
+        参数：
+            thickness_mm: 壁厚（毫米，>0，向内偏移）
+            box_*_mm:     可选。给了才算得出理论去料体积
+                          = 内腔 (L−2t)(W−2t)(H−t)。
+        """
+        if thickness_mm <= 0:
+            raise ValueError("壁厚必须为正数。")
+
+        t = float(thickness_mm)
+        dims = [box_length_mm, box_width_mm, box_height_mm]
+        if all(d is not None for d in dims):
+            L, W, H = (float(d) for d in dims)  # type: ignore[arg-type]
+            if 2 * t >= min(L, W) or t >= H:
+                raise ValueError(
+                    f"壁厚 {t} 过大 —— 2t 必须小于 min(长,宽)={min(L, W)}，"
+                    f"且 t 必须小于高 {H}，否则抽不出内腔。"
+                )
+
+        app = self._require_app()
+        part_doc = app.ActiveDocument
+        part = part_doc.Part
+        body = part.Bodies.Item(1)
+
+        vol_before = self._measure_volume_mm3(part_doc, part, body)
+
+        errors: list = []
+        faces, query = self._face_table(part_doc, app, errors)
+        if not faces:
+            raise RuntimeError(
+                "没能拾取到任何可测量的面，抽壳无法进行。\n"
+                "各次尝试的原始报错：\n  " + "\n  ".join(str(e) for e in errors)
+            )
+        top = max(faces, key=lambda f: f["cog_mm"][2])
+
+        part.InWorkObject = body
+        shell, strategy, shell_errors = self._add_shell_on_face(part, top["ref"], t)
+        errors.extend(shell_errors)
+
+        update_ok = True
+        try:
+            part.Update()
+        except pythoncom.com_error:  # type: ignore[attr-defined]
+            update_ok = False
+
+        vol_after = self._measure_volume_mm3(part_doc, part, body)
+        measured_removed: Optional[float] = None
+        if vol_before is not None and vol_after is not None:
+            measured_removed = vol_before - vol_after
+
+        expected_removed: Optional[float] = None
+        if all(d is not None for d in dims):
+            L, W, H = (float(d) for d in dims)  # type: ignore[arg-type]
+            expected_removed = (L - 2 * t) * (W - 2 * t) * (H - t)
+
+        match: Optional[bool] = None
+        rel_err: Optional[float] = None
+        if measured_removed is not None and expected_removed:
+            rel_err = abs(measured_removed - expected_removed) / expected_removed
+            match = rel_err <= volume_tolerance
+
+        return ShellResult(
+            document_name=str(part_doc.Name),
+            body_name=str(body.Name),
+            shell_name=str(shell.Name),
+            thickness_mm=t,
+            removed_face=FaceInfo(
+                index=top["index"], area_mm2=top["area_mm2"], cog_mm=top["cog_mm"]
+            ),
+            face_candidates=len(faces),
+            strategy=f"{query}/{strategy}",
+            update_ok=update_ok,
+            volume_before_mm3=vol_before,
+            volume_after_mm3=vol_after,
+            measured_removed_mm3=measured_removed,
+            expected_removed_mm3=expected_removed,
+            volume_match=match,
+            relative_error=rel_err,
+            target_errors=errors or None,
+        )
+
+    def add_draft(
+        self,
+        angle_deg: float,
+        box_length_mm: Optional[float] = None,
+        box_width_mm: Optional[float] = None,
+        box_height_mm: Optional[float] = None,
+        volume_tolerance: float = 1e-3,
+    ) -> DraftResult:
+        """给当前活动 Part 的四个侧面加拔模斜度（底面为中性面），并用体积差验证。
+
+        ── 这一步真正新增的东西：多引用协同 ──
+        前面所有特征最多只要一组同类引用；拔模要**三样东西同时对**：
+            被拔模的面（一组侧面）、中性面（拔模时保持不变的基准，这里取底面）、
+            拔模方向（这里取 Z 轴，用 PlaneXY 的法向表达）。
+        错一个，结果就不是想要的形状 —— 而且**未必报错**，可能安静地做出个别的东西。
+
+        ── 所以这里的验证要比前面更狠 ──
+        拔模到底是加料（上大下小）还是去料（上小下大），取决于角度符号和
+        CATIA 的方向约定 —— 这是**实测才能定**的事。所以同时算出两种情形的
+        精确解（棱台体积，Prismatoid 公式），看实测符合哪一个，把结论写进
+        `matched_direction`。两个候选值大小并不相等，所以"二选一"仍是硬验证，
+        不是放水。
+
+        参数：
+            angle_deg: 拔模角（度，0 < a < 45）
+            box_*_mm:  可选。给了才算得出理论体积变化。
+        """
+        if not 0 < angle_deg < 45:
+            raise ValueError(f"拔模角必须在 (0, 45) 之间，收到 {angle_deg}。")
+
+        app = self._require_app()
+        part_doc = app.ActiveDocument
+        part = part_doc.Part
+        body = part.Bodies.Item(1)
+
+        vol_before = self._measure_volume_mm3(part_doc, part, body)
+
+        errors: list = []
+        faces, query = self._face_table(part_doc, app, errors)
+        if len(faces) < 3:
+            raise RuntimeError(
+                f"只拾到 {len(faces)} 个可测量的面，不足以区分顶/底/侧面，拔模无法进行。\n"
+                "各次尝试的原始报错：\n  " + "\n  ".join(str(e) for e in errors)
+            )
+
+        ordered = sorted(faces, key=lambda f: f["cog_mm"][2])
+        bottom = ordered[0]
+        top = ordered[-1]
+        sides = ordered[1:-1]
+        if not sides:
+            raise RuntimeError("除顶底面外没有侧面可拔模。")
+
+        part.InWorkObject = body
+        draft, strategy, draft_errors = self._add_draft_on_faces(
+            part, [f["ref"] for f in sides], bottom["ref"], float(angle_deg)
+        )
+        errors.extend(draft_errors)
+
+        update_ok = True
+        try:
+            part.Update()
+        except pythoncom.com_error:  # type: ignore[attr-defined]
+            update_ok = False
+
+        vol_after = self._measure_volume_mm3(part_doc, part, body)
+        delta: Optional[float] = None
+        if vol_before is not None and vol_after is not None:
+            delta = vol_after - vol_before
+
+        exp_out: Optional[float] = None
+        exp_in: Optional[float] = None
+        dims = [box_length_mm, box_width_mm, box_height_mm]
+        if all(d is not None for d in dims):
+            exp_out = self._box_draft_delta_mm3(
+                float(box_length_mm), float(box_width_mm),  # type: ignore[arg-type]
+                float(box_height_mm), float(angle_deg), outward=True,  # type: ignore[arg-type]
+            )
+            exp_in = self._box_draft_delta_mm3(
+                float(box_length_mm), float(box_width_mm),  # type: ignore[arg-type]
+                float(box_height_mm), float(angle_deg), outward=False,  # type: ignore[arg-type]
+            )
+
+        matched: Optional[str] = None
+        match: Optional[bool] = None
+        rel_err: Optional[float] = None
+        if delta is not None and exp_out is not None and exp_in is not None:
+            best = None
+            for label, expected in (("outward", exp_out), ("inward", exp_in)):
+                if not expected:
+                    continue
+                err = abs(delta - expected) / abs(expected)
+                if best is None or err < best[1]:
+                    best = (label, err)
+            if best is not None:
+                matched, rel_err = best
+                match = rel_err <= volume_tolerance
+                if not match:
+                    matched = None  # 两个都对不上，就别声称符合哪一个
+
+        return DraftResult(
+            document_name=str(part_doc.Name),
+            body_name=str(body.Name),
+            draft_name=str(draft.Name),
+            angle_deg=float(angle_deg),
+            faces_drafted=len(sides),
+            neutral_face=FaceInfo(
+                index=bottom["index"], area_mm2=bottom["area_mm2"], cog_mm=bottom["cog_mm"]
+            ),
+            face_candidates=len(faces),
+            strategy=f"{query}/{strategy}/sides={len(sides)}of{len(faces)}"
+                     f"/top_z={top['cog_mm'][2]:.3f}",
+            update_ok=update_ok,
+            volume_before_mm3=vol_before,
+            volume_after_mm3=vol_after,
+            measured_delta_mm3=delta,
+            expected_outward_mm3=exp_out,
+            expected_inward_mm3=exp_in,
+            matched_direction=matched,
+            volume_match=match,
+            relative_error=rel_err,
+            target_errors=errors or None,
+        )
+
+    # ------------------------------------------------------------------
     # 批量：一次生成一族变体
     # ------------------------------------------------------------------
     MAX_FAMILY_VARIANTS = 50
@@ -1242,6 +1671,269 @@ class CatiaClient:
         quarter_cylinders = math.pi * r * r * (a + b + c)
         corners = 4.0 / 3.0 * math.pi * r ** 3
         return length * width * height - (core + slabs + quarter_cylinders + corners)
+
+    # ------------------------------------------------------------------
+    # 修饰特征三兄弟的底层实现
+    # ------------------------------------------------------------------
+    def _add_chamfer_on_edges(
+        self, part_doc, part, length_mm: float, angle_deg: float, propagation: str
+    ):
+        """拾取实体全部边并倒斜角。返回 (chamfer, strategy, added, candidates, errors)。
+
+        边拾取完全复用 Fillet 那条已验证的路（`_search_edge_references`），
+        这里只处理斜角特有的一件事：**枚举值不确定**。
+
+        `CatChamferMode` 里「长度 + 角度」这一档，各处资料写作 0 / 1 / 2 的都有，
+        而且不同 R 版还可能不同。与其押一个值然后在别的机器上炸掉，不如按序试，
+        并把**实际生效的值写进 strategy** —— 第一次在真机上跑完，这个值就被钉死了，
+        以后出问题也能一眼看出是不是它变了。
+        """
+        # catTangencyChamfer = 1 / catMinimalChamfer = 2
+        prop = 1 if propagation == "tangency" else 2
+        shape_factory = part.ShapeFactory
+        errors: list = []
+
+        refs, query = self._search_edge_references(part_doc, errors)
+        if not refs:
+            raise RuntimeError(
+                "没能拾取到任何边，倒斜角无法进行。\n"
+                "各次尝试的原始报错：\n  " + "\n  ".join(str(e) for e in errors)
+            )
+
+        attempts = [
+            (name, mode)
+            for name in ("AddNewSolidEdgeChamfer", "AddNewChamfer")
+            for mode in (1, 2, 0)
+        ]
+        for method_name, mode in attempts:
+            method = getattr(shape_factory, method_name, None)
+            if method is None:
+                continue
+            try:
+                chamfer = method(refs[0], prop, mode, length_mm, angle_deg)
+            except pythoncom.com_error as exc:  # type: ignore[attr-defined]
+                errors.append(f"{method_name}(mode={mode}): {exc}")
+                continue
+
+            added = 1
+            rejected = 0
+            for ref in refs[1:]:
+                try:
+                    chamfer.AddObjectToChamfer(ref)
+                    added += 1
+                except pythoncom.com_error:  # type: ignore[attr-defined]
+                    # 与 Fillet 同理：搜索是全文档范围的，会捞到草图线等非实体边。
+                    rejected += 1
+            if rejected:
+                errors.append(
+                    f"{rejected}/{len(refs)} 个候选被 CATIA 拒绝（通常是草图线等非实体边，属预期内）"
+                )
+            return (
+                chamfer,
+                f"{query}/{method_name}(mode={mode})/edges={added}of{len(refs)}",
+                added,
+                len(refs),
+                errors,
+            )
+
+        raise RuntimeError(
+            f"拾到了 {len(refs)} 个候选，但 ShapeFactory 的倒斜角方法/枚举组合都失败了。\n"
+            "各次尝试的原始报错：\n  " + "\n  ".join(str(e) for e in errors)
+        )
+
+    def _face_table(self, part_doc, app, errors: list):
+        """把实体的每个面连同面积、重心列成表。返回 (table, 生效的查询串)。
+
+        ── 为什么非得测一遍才能挑面 ──
+        `Selection.Search` 回来的顺序**不保证**。按索引挑面（"第 3 个是顶面"）
+        在自己这台机器上能跑，换个模型、换个 R 版就悄悄挑错 —— 而且不报错，
+        只是做出个别的东西。按「重心 Z 最大」挑顶面则是几何事实，永远成立。
+
+        代价是每个面一次 GetMeasurable + 一次重心读取（重心还得走 VBA 蹦床）。
+        长方体六个面而已，这笔开销买的是**换模型不会错**。
+        """
+        refs, query = self._search_face_references(part_doc, errors)
+        if not refs:
+            return [], query
+
+        try:
+            spa = part_doc.GetWorkbench("SPAWorkbench")
+        except pythoncom.com_error as exc:  # type: ignore[attr-defined]
+            errors.append(f"GetWorkbench(SPAWorkbench): {exc}")
+            return [], query
+
+        table: list = []
+        for i, ref in enumerate(refs):
+            try:
+                measurable = spa.GetMeasurable(ref)
+            except pythoncom.com_error as exc:  # type: ignore[attr-defined]
+                errors.append(f"GetMeasurable(候选面 {i + 1}): {exc}")
+                continue
+            area = self._read_si(measurable, "Area", 1e6, errors)
+            cog, _strategy, attempts = self._read_cog_mm(measurable, app)
+            if cog is None:
+                errors.append(
+                    f"候选面 {i + 1} 读不到重心，已跳过。首个原因："
+                    f"{attempts[0] if attempts else '未知'}"
+                )
+                continue
+            table.append({"ref": ref, "index": i, "area_mm2": area, "cog_mm": cog})
+        return table, query
+
+    @staticmethod
+    def _search_face_references(part_doc, errors: list):
+        """把实体上的面全部捞出来，返回 (refs, 生效的查询串)。与找边同一套路。"""
+        queries = (
+            "Topology.CGMFace,all",
+            "Topology.CGMFace,sel",
+            "'Topology'.CGMFace,all",
+        )
+        selection = part_doc.Selection
+        for query in queries:
+            try:
+                selection.Clear()
+                selection.Search(query)
+                count = int(getattr(selection, "Count2", 0) or selection.Count)
+                if count <= 0:
+                    errors.append(f"Search({query!r}): 命中 0 条")
+                    continue
+                refs = [selection.Item(i).Reference for i in range(1, count + 1)]
+                selection.Clear()
+                return refs, f"Search({query})"
+            except pythoncom.com_error as exc:  # type: ignore[attr-defined]
+                errors.append(f"Search({query!r}): {exc}")
+            finally:
+                try:
+                    selection.Clear()
+                except pythoncom.com_error:  # type: ignore[attr-defined]
+                    pass
+        return [], ""
+
+    @staticmethod
+    def _add_shell_on_face(part, face_ref, thickness_mm: float):
+        """在指定面上开口抽壳。返回 (shell, strategy, errors)。
+
+        `AddNewShell(要去掉的面, 内侧厚度, 外侧厚度)`：内侧厚度是**向内**偏移的
+        壁厚，外侧给 0 —— 这样外轮廓不变，体积差才等于内腔体积，精确解才立得住。
+        """
+        shape_factory = part.ShapeFactory
+        errors: list = []
+        for method_name in ("AddNewShell", "AddNewSolidShell"):
+            method = getattr(shape_factory, method_name, None)
+            if method is None:
+                continue
+            try:
+                shell = method(face_ref, float(thickness_mm), 0.0)
+            except pythoncom.com_error as exc:  # type: ignore[attr-defined]
+                errors.append(f"{method_name}: {exc}")
+                continue
+            return shell, f"{method_name}(inner={thickness_mm},outer=0)", errors
+        raise RuntimeError(
+            "ShapeFactory 的抽壳方法都调用失败。\n"
+            "各次尝试的原始报错：\n  " + "\n  ".join(str(e) for e in errors)
+        )
+
+    @staticmethod
+    def _add_draft_on_faces(part, side_refs: list, neutral_ref, angle_deg: float):
+        """给一组侧面加拔模。返回 (draft, strategy, errors)。
+
+        ── 这里第一次要用到 References 集合 ──
+        `AddNewDraft` 收的不是单个 Reference，而是一个 `References` 集合对象
+        （`part.CreateReferences()` 造出来再逐个 Add）。这是本项目第一次碰它，
+        所以万一这台机器上不存在，报错要说清是哪一步没过，而不是甩个 AttributeError。
+
+        ── 两个枚举同样按序试 ──
+        中性面传播模式和拔模模式的取值资料不一，做法与斜角一致：按序试、
+        把生效的写进 strategy、用体积把结果钉死。
+        """
+        shape_factory = part.ShapeFactory
+        errors: list = []
+
+        maker = getattr(part, "CreateReferences", None)
+        if maker is None:
+            raise RuntimeError(
+                "这台机器上的 Part 对象没有 CreateReferences —— 无法构造 References 集合，"
+                "拔模拿不到入参。请把这条报错原样贴回来，据此换别的构造方式。"
+            )
+        try:
+            refs_col = maker()
+            for ref in side_refs:
+                refs_col.Add(ref)
+        except pythoncom.com_error as exc:  # type: ignore[attr-defined]
+            raise RuntimeError(f"构造 References 集合失败：{exc}") from exc
+
+        try:
+            direction = part.CreateReferenceFromObject(part.OriginElements.PlaneXY)
+        except pythoncom.com_error as exc:  # type: ignore[attr-defined]
+            raise RuntimeError(f"取不到拔模方向（PlaneXY 的引用）：{exc}") from exc
+
+        method = getattr(shape_factory, "AddNewDraft", None)
+        if method is None:
+            raise RuntimeError("ShapeFactory 上没有 AddNewDraft。")
+
+        for neutral_mode in (1, 2, 0):
+            for draft_mode in (0, 1):
+                try:
+                    draft = method(
+                        refs_col, neutral_ref, neutral_mode,
+                        direction, float(angle_deg), draft_mode,
+                    )
+                except pythoncom.com_error as exc:  # type: ignore[attr-defined]
+                    errors.append(
+                        f"AddNewDraft(neutral={neutral_mode},mode={draft_mode}): {exc}"
+                    )
+                    continue
+                return (
+                    draft,
+                    f"AddNewDraft(neutral={neutral_mode},mode={draft_mode})",
+                    errors,
+                )
+
+        raise RuntimeError(
+            "AddNewDraft 的所有枚举组合都失败了。\n"
+            "各次尝试的原始报错：\n  " + "\n  ".join(str(e) for e in errors)
+        )
+
+    @staticmethod
+    def _box_chamfer_removed_mm3(
+        length: float, width: float, height: float, d: float
+    ) -> float:
+        """长方体 12 条边全部倒 45° 斜角（边长 d）后被切掉的体积（精确解）。
+
+        与倒圆角同一套拆法，只是把圆的零件换成直的：
+            内芯长方体 + 6 块面板 + 12 段三棱柱（截面 d²/2）+ 8 个角块
+        角块是三个斜面围出来的立体，体积恰为 d³/4 —— 八个拼起来正好是
+        棱长 d 的**菱形十二面体**（体积 2d³），这不是巧合：
+        把边长 2d 的正方体十二条边各切 d，剩下的就是它。
+
+        化简后 removed = 2d²(a+b+c) + 6d³，但这里保留拆解写法，
+        因为**每一项都能对上一个看得见的零件**，出错时好查。
+        """
+        a, b, c = length - 2 * d, width - 2 * d, height - 2 * d
+        core = a * b * c
+        slabs = 2 * d * (a * b + a * c + b * c)
+        prisms = 2 * d * d * (a + b + c)          # 12 段三棱柱
+        corners = 2 * d ** 3                      # 8 个角块，每个 d³/4
+        return length * width * height - (core + slabs + prisms + corners)
+
+    @staticmethod
+    def _box_draft_delta_mm3(
+        length: float, width: float, height: float, angle_deg: float, outward: bool
+    ) -> float:
+        """四个侧面拔模后的体积变化量（精确解，带符号）。
+
+        底面为中性面，所以底面仍是 length × width，顶面每边缩放 k = H·tan(a)。
+        结果是个棱台，用 Prismatoid 公式（对棱台是精确的，不是近似）：
+            V = H/6 · (A_bottom + 4·A_mid + A_top)
+        化简后：V = H·[LW ± k(L+W) + 4k²/3]，所以
+            ΔV = H·[±k(L+W) + 4k²/3]
+
+        注意两个方向的 |ΔV| **并不相等**（加料那项和去料那项差了 2k(L+W)H），
+        所以"看实测符合哪一个"仍然是硬判据，不是二选一的放水。
+        """
+        k = height * math.tan(math.radians(angle_deg))
+        sign = 1.0 if outward else -1.0
+        return height * (sign * k * (length + width) + 4.0 * k * k / 3.0)
 
     # ------------------------------------------------------------------
     # 导出能力探针 —— 定位「ExportData failed」到底是许可证还是 STEP 单独没授权

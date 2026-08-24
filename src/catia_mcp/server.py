@@ -335,6 +335,129 @@ def add_fillet(
 
 
 @mcp.tool()
+def add_chamfer(
+    length_mm: float,
+    angle_deg: float = 45.0,
+    box_length_mm: float | None = None,
+    box_width_mm: float | None = None,
+    box_height_mm: float | None = None,
+    propagation: str = "tangency",
+) -> dict:
+    """给当前活动 Part 的实体全部边倒斜角（Chamfer），并用体积差验证。
+
+    与 add_fillet 同一条边拾取路径，换把刀而已 —— 直棱代替圆弧。
+    什么时候用它而不是倒圆角：去毛刺、装配导入角、焊接坡口这类场景要的是斜面；
+    要减应力集中或做外观过渡才用圆角。
+
+    参数：
+        length_mm:   斜角第一条边长（毫米，>0）
+        angle_deg:   斜角角度，默认 45°。**只有 45° 有精确解验证**，
+                     其余角度只做弱验证（会如实把 expected_removed_mm3 报成 null，
+                     不会拿近似值假装验过）。
+        box_*_mm:    可选但强烈建议传，传了才有硬验证。
+        propagation: "tangency"（默认）或 "minimal"
+
+    返回（既是结果也是证据）：
+        strategy:               实际生效的方法与枚举值（自证）
+        objects_chamfered:      实际倒了多少条边（长方体应为 12）
+        expected/measured_removed_mm3、volume_match、relative_error
+
+    使用建议：update_ok 与 volume_match 都为 true 才算合格。
+    """
+
+    def _job(client: CatiaClient):
+        return client.add_chamfer(
+            length_mm=length_mm,
+            angle_deg=angle_deg,
+            box_length_mm=box_length_mm,
+            box_width_mm=box_width_mm,
+            box_height_mm=box_height_mm,
+            propagation=propagation,
+        )
+
+    result = _worker.call(_job, timeout=120.0, label="add_chamfer")
+    return asdict(result)
+
+
+@mcp.tool()
+def add_shell(
+    thickness_mm: float,
+    box_length_mm: float | None = None,
+    box_width_mm: float | None = None,
+    box_height_mm: float | None = None,
+) -> dict:
+    """把当前活动 Part 的实体抽成薄壳（自动去掉顶面开口），并用体积差验证。
+
+    这是第一个**必须指名道姓挑一个面**的特征。挑面不按索引（顺序不保证），
+    而是逐面测重心、取 Z 最大的那个 —— 换任何模型都成立。
+    被选中面的面积和重心会一并返回，所以「它到底挑了哪个面」有据可查。
+
+    参数：
+        thickness_mm: 壁厚（毫米，>0，向内偏移，外轮廓不变）
+        box_*_mm:     可选。传了才算得出理论去料体积 = (L−2t)(W−2t)(H−t)。
+
+    返回（既是结果也是证据）：
+        removed_face:   被去掉面的 index / area_mm2 / cog_mm（自证挑对了没有）
+        face_candidates: 一共拾到几个面（长方体应为 6）
+        expected/measured_removed_mm3、volume_match、relative_error
+
+    使用建议：壁厚要满足 2t < min(长,宽) 且 t < 高，否则抽不出内腔（会直接报错拦下）。
+    """
+
+    def _job(client: CatiaClient):
+        return client.add_shell(
+            thickness_mm=thickness_mm,
+            box_length_mm=box_length_mm,
+            box_width_mm=box_width_mm,
+            box_height_mm=box_height_mm,
+        )
+
+    result = _worker.call(_job, timeout=180.0, label="add_shell")
+    return asdict(result)
+
+
+@mcp.tool()
+def add_draft(
+    angle_deg: float,
+    box_length_mm: float | None = None,
+    box_width_mm: float | None = None,
+    box_height_mm: float | None = None,
+) -> dict:
+    """给当前活动 Part 的四个侧面加拔模斜度（底面为中性面），并用体积差验证。
+
+    铸造/注塑件脱模必需的特征。三样东西同时给对才成立：被拔模的侧面、
+    中性面（保持不变的基准，这里取底面）、拔模方向（Z 轴）。
+
+    参数：
+        angle_deg: 拔模角（度，0 < a < 45，常见 1~5）
+        box_*_mm:  可选。传了才算得出理论体积变化。
+
+    返回（既是结果也是证据）：
+        faces_drafted:          实际拔了几个面（长方体应为 4）
+        neutral_face:           中性面的面积与重心（自证选的是底面）
+        measured_delta_mm3:     实测体积变化，**带符号**
+        expected_outward_mm3 / expected_inward_mm3:
+                                上大下小 / 上小下大 两种情形的精确解
+        matched_direction:      实测符合哪一个（两者大小不等，所以这仍是硬验证）
+        volume_match、relative_error
+
+    使用建议：先看 matched_direction 是否有值 —— 为 null 说明两种情形都对不上，
+    那就是真出问题了，去看 strategy 和 target_errors。
+    """
+
+    def _job(client: CatiaClient):
+        return client.add_draft(
+            angle_deg=angle_deg,
+            box_length_mm=box_length_mm,
+            box_width_mm=box_width_mm,
+            box_height_mm=box_height_mm,
+        )
+
+    result = _worker.call(_job, timeout=180.0, label="add_draft")
+    return asdict(result)
+
+
+@mcp.tool()
 def create_box_family(
     variants: list[dict],
     output_dir: str | None = None,
